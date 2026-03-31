@@ -2,6 +2,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cstring>
+#include <unistd.h>
 
 #ifdef __linux__
 #  include <sys/epoll.h>

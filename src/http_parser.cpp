@@ -19,16 +19,23 @@ void HttpParser::reset() {
 }
 
 HttpParser::Result HttpParser::parse(Buffer& buf) {
-    Result r = INCOMPLETE;
-    while (r == INCOMPLETE) {
+    // Drive the state machine. Only continue looping when the state advanced
+    // (e.g. REQUEST_LINE -> HEADERS); a same-state INCOMPLETE means we need
+    // more data from the caller.
+    for (;;) {
+        State before = state_;
+        Result r = INCOMPLETE;
         switch (state_) {
         case State::REQUEST_LINE: r = parse_request_line(buf); break;
         case State::HEADERS:      r = parse_headers(buf);      break;
         case State::BODY:         r = parse_body(buf);         break;
         case State::DONE:         return COMPLETE;
         }
+        if (r == ERROR)      return ERROR;
+        if (r == COMPLETE)   return COMPLETE;
+        // r == INCOMPLETE: stop if no state transition occurred
+        if (state_ == before) return INCOMPLETE;
     }
-    return r;
 }
 
 HttpParser::Result HttpParser::parse_request_line(Buffer& buf) {
