@@ -3,9 +3,9 @@
 
 #include "tinycoro/event_loop.h"
 #include "tinycoro/tcp_server.h"
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <csignal>
 
 static tinycoro::EventLoop* g_loop = nullptr;
 
@@ -16,17 +16,21 @@ int main(int argc, char* argv[]) {
     g_loop = &loop;
 
     // Graceful shutdown on SIGINT/SIGTERM
-    std::signal(SIGINT,  [](int) { if (g_loop) g_loop->stop(); });
-    std::signal(SIGTERM, [](int) { if (g_loop) g_loop->stop(); });
+    std::signal(SIGINT, [](int) {
+        if (g_loop)
+            g_loop->stop();
+    });
+    std::signal(SIGTERM, [](int) {
+        if (g_loop)
+            g_loop->stop();
+    });
 
     tinycoro::TcpServer server(&loop, port);
 
-    server.set_connection_callback([](tinycoro::TcpConnectionPtr conn) {
-        std::printf("[+] connection fd=%d\n", conn->fd());
-    });
+    server.set_connection_callback(
+        [](tinycoro::TcpConnectionPtr conn) { std::printf("[+] connection fd=%d\n", conn->fd()); });
 
-    server.set_message_callback([](tinycoro::TcpConnectionPtr conn,
-                                   tinycoro::Buffer& buf) {
+    server.set_message_callback([](tinycoro::TcpConnectionPtr conn, tinycoro::Buffer& buf) {
         // Echo everything back
         std::string data = buf.retrieve_all_as_string();
         conn->send(data);

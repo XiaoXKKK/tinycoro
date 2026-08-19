@@ -5,12 +5,14 @@
 #include <netinet/in.h>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <system_error>
 #include <unistd.h>
 
 namespace tinycoro {
 
-TcpServer::TcpServer(EventLoop* loop, uint16_t port)
-    : loop_(loop), port_(port) {
+TcpServer::TcpServer(EventLoop* loop, std::uint16_t port) : loop_(loop), port_(port) {
+    if (!loop_)
+        throw std::invalid_argument("TcpServer requires an EventLoop");
     listen_fd_ = create_listen_fd(port_);
     accept_channel_.fd = listen_fd_;
     accept_channel_.interest = Event::READ;
@@ -18,81 +20,113 @@ TcpServer::TcpServer(EventLoop* loop, uint16_t port)
 }
 
 TcpServer::~TcpServer() {
-    if (listen_fd_ >= 0) {
+    // Destruction is not a user-observable close event and must not call code
+    // that can throw while unwinding the server.
+    close_callback_ = {};
+    while (!connections_.empty())
+        connections_.begin()->second->close();
+    if (started_)
         loop_->remove_channel(&accept_channel_);
+    if (listen_fd_ >= 0)
         ::close(listen_fd_);
-    }
 }
 
 void TcpServer::start() {
+    if (started_)
+        throw std::logic_error("TcpServer already started");
     loop_->add_channel(&accept_channel_);
+    started_ = true;
 }
 
 void TcpServer::handle_accept() {
-    // ET mode: accept in a loop until EAGAIN
     for (;;) {
-        struct sockaddr_in addr{};
-        socklen_t addrlen = sizeof(addr);
-        int conn_fd = ::accept(listen_fd_,
-                               reinterpret_cast<sockaddr*>(&addr), &addrlen);
-        if (conn_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            break; // unexpected error; just stop accepting this round
+        sockaddr_in address{};
+        socklen_t address_size = sizeof(address);
+        const int connection_fd =
+            ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&address), &address_size);
+        if (connection_fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            break;
         }
 
-        set_nonblocking(conn_fd);
+        try {
+            set_nonblocking(connection_fd);
+        } catch (...) {
+            ::close(connection_fd);
+            throw;
+        }
 
-        auto conn = std::make_shared<TcpConnection>(conn_fd, loop_);
-        connections_[conn_fd] = conn;
-
-        if (msg_cb_)  conn->set_message_callback(msg_cb_);
-        conn->set_close_callback([this](TcpConnectionPtr c) {
-            handle_close(c);
-        });
-
-        conn->start();
-
-        if (conn_cb_) conn_cb_(conn);
+        std::shared_ptr<TcpConnection> connection;
+        try {
+            connection = std::make_shared<TcpConnection>(connection_fd, loop_);
+            connection->set_close_callback(
+                [this](TcpConnectionPtr closed) { handle_close(std::move(closed)); });
+            if (message_callback_) {
+                connection->set_message_callback(message_callback_);
+            }
+            connections_.emplace(connection_fd, connection);
+            connection->start();
+            if (connection_callback_)
+                connection_callback_(connection);
+        } catch (...) {
+            if (connection && !connection->closed())
+                connection->close();
+            throw;
+        }
     }
 }
 
-void TcpServer::handle_close(TcpConnectionPtr conn) {
-    connections_.erase(conn->fd());
+void TcpServer::handle_close(TcpConnectionPtr connection) {
+    auto callback = close_callback_;
+    connections_.erase(connection->fd());
+    if (callback)
+        callback(std::move(connection));
 }
 
-// ---- helpers -----------------------------------------------------------
+int TcpServer::create_listen_fd(std::uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "socket");
 
-int TcpServer::create_listen_fd(uint16_t port) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-
-    set_reuse_addr(fd);
-    set_nonblocking(fd);
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    try {
+        set_reuse_addr(fd);
+        set_nonblocking(fd);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+            throw std::system_error(errno, std::generic_category(), "bind");
+        }
+        if (::listen(fd, SOMAXCONN) < 0) {
+            throw std::system_error(errno, std::generic_category(), "listen");
+        }
+    } catch (...) {
         ::close(fd);
-        throw std::runtime_error("bind() failed");
-    }
-    if (::listen(fd, SOMAXCONN) < 0) {
-        ::close(fd);
-        throw std::runtime_error("listen() failed");
+        throw;
     }
     return fd;
 }
 
 void TcpServer::set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const int status_flags = fcntl(fd, F_GETFL, 0);
+    if (status_flags < 0 || fcntl(fd, F_SETFL, status_flags | O_NONBLOCK) < 0) {
+        throw std::system_error(errno, std::generic_category(), "fcntl O_NONBLOCK");
+    }
+    const int descriptor_flags = fcntl(fd, F_GETFD, 0);
+    if (descriptor_flags < 0 || fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+        throw std::system_error(errno, std::generic_category(), "fcntl FD_CLOEXEC");
+    }
 }
 
 void TcpServer::set_reuse_addr(int fd) {
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    const int enabled = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0) {
+        throw std::system_error(errno, std::generic_category(), "setsockopt SO_REUSEADDR");
+    }
 }
 
 } // namespace tinycoro

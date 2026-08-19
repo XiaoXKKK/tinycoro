@@ -1,110 +1,151 @@
 #include "tinycoro/buffer.h"
 #include "tinycoro/http_parser.h"
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <string>
 
 using namespace tinycoro;
 
-// ---- Buffer ------------------------------------------------------------
-
 TEST(BufferTest, AppendAndRead) {
-    Buffer buf;
-    buf.append("hello", 5);
-    EXPECT_EQ(buf.readable(), 5u);
-    EXPECT_EQ(std::string(buf.read_ptr(), buf.readable()), "hello");
+    Buffer buffer;
+    buffer.append("hello", 5);
+    EXPECT_EQ(buffer.readable(), 5u);
+    EXPECT_EQ(std::string(buffer.read_ptr(), buffer.readable()), "hello");
+}
+
+TEST(BufferTest, DirectWriteCommit) {
+    Buffer buffer(8);
+    std::memcpy(buffer.write_ptr(), "direct", 6);
+    buffer.has_written(6);
+    EXPECT_EQ(buffer.retrieve_all_as_string(), "direct");
 }
 
 TEST(BufferTest, ConsumeResetsOnEmpty) {
-    Buffer buf;
-    buf.append("hi", 2);
-    buf.consume(2);
-    EXPECT_EQ(buf.readable(), 0u);
-    // After full consume, internal pointers reset to 0 — new appends go to front
-    buf.append("world", 5);
-    EXPECT_EQ(buf.readable(), 5u);
+    Buffer buffer;
+    buffer.append("hi", 2);
+    buffer.consume(2);
+    EXPECT_EQ(buffer.readable(), 0u);
+    buffer.append("world", 5);
+    EXPECT_EQ(buffer.readable(), 5u);
+}
+
+TEST(BufferTest, RejectsOutOfRangeCursorMovement) {
+    Buffer buffer(4);
+    buffer.append("abc", 3);
+    EXPECT_THROW(buffer.consume(4), std::out_of_range);
+    EXPECT_THROW(buffer.has_written(2), std::out_of_range);
 }
 
 TEST(BufferTest, RetrieveAllAsString) {
-    Buffer buf;
-    buf.append("abc", 3);
-    buf.append("def", 3);
-    std::string s = buf.retrieve_all_as_string();
-    EXPECT_EQ(s, "abcdef");
-    EXPECT_EQ(buf.readable(), 0u);
+    Buffer buffer;
+    buffer.append("abc", 3);
+    buffer.append("def", 3);
+    EXPECT_EQ(buffer.retrieve_all_as_string(), "abcdef");
+    EXPECT_EQ(buffer.readable(), 0u);
 }
 
 TEST(BufferTest, FindCRLF) {
-    Buffer buf;
-    buf.append("GET / HTTP/1.1\r\n", 16);
-    EXPECT_EQ(buf.find_crlf(), 14u);
+    Buffer buffer;
+    buffer.append("GET / HTTP/1.1\r\n", 16);
+    EXPECT_EQ(buffer.find_crlf(), 14u);
 }
 
 TEST(BufferTest, GrowsOnLargeAppend) {
-    Buffer buf(16); // small initial size
-    std::string big(1024, 'x');
-    buf.append(big);
-    EXPECT_EQ(buf.readable(), 1024u);
+    Buffer buffer(16);
+    const std::string large(1024, 'x');
+    buffer.append(large);
+    EXPECT_EQ(buffer.readable(), 1024u);
 }
 
-// ---- HttpParser --------------------------------------------------------
-
-TEST(HttpParserTest, SimpleGET) {
+TEST(HttpParserTest, SimpleGet) {
     HttpParser parser;
-    Buffer buf;
-    std::string req =
-        "GET /hello HTTP/1.1\r\n"
-        "Host: localhost\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n";
-    buf.append(req);
+    Buffer buffer;
+    buffer.append("GET /hello HTTP/1.1\r\n"
+                  "Host: localhost\r\n"
+                  "Connection: keep-alive\r\n\r\n");
 
-    auto result = parser.parse(buf);
-    EXPECT_EQ(result, HttpParser::COMPLETE);
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
     EXPECT_EQ(parser.request().method, "GET");
     EXPECT_EQ(parser.request().path, "/hello");
     EXPECT_EQ(parser.request().version, "HTTP/1.1");
     EXPECT_EQ(parser.request().headers.at("Host"), "localhost");
 }
 
-TEST(HttpParserTest, POSTWithBody) {
+TEST(HttpParserTest, PostBodyMayArriveInFragments) {
     HttpParser parser;
-    Buffer buf;
-    std::string body = "name=world";
-    std::string req =
-        "POST /echo HTTP/1.1\r\n"
-        "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "\r\n" + body;
-    buf.append(req);
-
-    auto result = parser.parse(buf);
-    EXPECT_EQ(result, HttpParser::COMPLETE);
-    EXPECT_EQ(parser.request().method, "POST");
-    EXPECT_EQ(parser.request().body, body);
+    Buffer buffer;
+    buffer.append("POST /echo HTTP/1.1\r\n"
+                  "Content-Length: 10\r\n\r\n"
+                  "1234");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::INCOMPLETE);
+    buffer.append("567890");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
+    EXPECT_EQ(parser.request().body, "1234567890");
 }
 
-TEST(HttpParserTest, IncompleteRequest) {
+TEST(HttpParserTest, IncompleteRequestDoesNotSpin) {
     HttpParser parser;
-    Buffer buf;
-    // Only the request line, no headers yet
-    buf.append("GET / HTTP/1.1\r\n");
-    auto result = parser.parse(buf);
-    EXPECT_EQ(result, HttpParser::INCOMPLETE);
+    Buffer buffer;
+    buffer.append("GET / HTTP/1.1\r\n");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::INCOMPLETE);
 }
 
-TEST(HttpParserTest, ResetAndReuseKeepAlive) {
+TEST(HttpParserTest, ResetPreservesPipelinedBytes) {
     HttpParser parser;
-    Buffer buf;
+    Buffer buffer;
+    buffer.append("GET /first HTTP/1.1\r\nHost: x\r\n\r\n"
+                  "GET /second HTTP/1.1\r\nHost: x\r\n\r\n");
 
-    auto make_get = [](const std::string& path) {
-        return "GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n";
-    };
-
-    buf.append(make_get("/first"));
-    EXPECT_EQ(parser.parse(buf), HttpParser::COMPLETE);
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
     EXPECT_EQ(parser.request().path, "/first");
+    EXPECT_GT(buffer.readable(), 0u);
 
     parser.reset();
-    buf.append(make_get("/second"));
-    EXPECT_EQ(parser.parse(buf), HttpParser::COMPLETE);
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
     EXPECT_EQ(parser.request().path, "/second");
+    EXPECT_EQ(buffer.readable(), 0u);
+}
+
+TEST(HttpParserTest, InvalidContentLengthReturnsError) {
+    HttpParser parser;
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Content-Length: not-a-number\r\n\r\n");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+}
+
+TEST(HttpParserTest, ConflictingContentLengthsAreRejected) {
+    HttpParser parser;
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Content-Length: 1\r\n"
+                  "content-length: 2\r\n\r\n"
+                  "xx");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+}
+
+TEST(HttpParserTest, UnsupportedChunkedEncodingIsRejected) {
+    HttpParser parser;
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Transfer-Encoding: chunked\r\n\r\n");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+}
+
+TEST(HttpParserTest, ConfiguredLimitsBoundMemoryGrowth) {
+    HttpParser::Limits limits;
+    limits.request_line_bytes = 16;
+    limits.header_bytes = 32;
+    limits.body_bytes = 4;
+    HttpParser parser(limits);
+    Buffer buffer;
+    buffer.append("GET /this-path-is-too-long");
+    EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+
+    parser.reset();
+    Buffer body;
+    body.append("POST / HTTP/1.1\r\n"
+                "Content-Length: 5\r\n\r\n"
+                "12345");
+    EXPECT_EQ(parser.parse(body), HttpParser::ERROR);
 }

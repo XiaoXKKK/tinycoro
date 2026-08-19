@@ -1,6 +1,6 @@
 #include "tinycoro/queue.h"
-#include <gtest/gtest.h>
 #include <atomic>
+#include <gtest/gtest.h>
 #include <thread>
 #include <vector>
 
@@ -30,7 +30,8 @@ TEST(SPSCQueueTest, Full) {
     SPSCQueue<int, 4> q; // capacity 4, usable slots = 3 (ring buffer full condition)
     // Fill until full
     int pushed = 0;
-    while (q.push(pushed)) ++pushed;
+    while (q.push(pushed))
+        ++pushed;
     EXPECT_EQ(pushed, 3); // 4-1 = 3 slots usable
 
     auto v = q.pop();
@@ -45,7 +46,8 @@ TEST(SPSCQueueTest, ConcurrentSPSC) {
 
     std::thread producer([&] {
         for (int i = 0; i < N; ++i) {
-            while (!q.push(i)) std::this_thread::yield();
+            while (!q.push(i))
+                std::this_thread::yield();
         }
     });
 
@@ -94,7 +96,8 @@ TEST(MPMCQueueTest, ConcurrentMPMC) {
         producers.emplace_back([&, p] {
             int start = p * PER_PRODUCER;
             for (int i = start; i < start + PER_PRODUCER; ++i) {
-                while (!q.push(i)) std::this_thread::yield();
+                while (!q.push(i))
+                    std::this_thread::yield();
             }
         });
     }
@@ -114,8 +117,10 @@ TEST(MPMCQueueTest, ConcurrentMPMC) {
         });
     }
 
-    for (auto& t : producers) t.join();
-    for (auto& t : consumers) t.join();
+    for (auto& t : producers)
+        t.join();
+    for (auto& t : consumers)
+        t.join();
 
     long long expected = static_cast<long long>(TOTAL) * (TOTAL - 1) / 2;
     EXPECT_EQ(sum.load(), expected);

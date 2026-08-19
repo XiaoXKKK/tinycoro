@@ -1,105 +1,128 @@
 #include "tinycoro/tcp_connection.h"
 #include <cerrno>
-#include <cstring>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace tinycoro {
+namespace {
+int send_flags() {
+#ifdef MSG_NOSIGNAL
+    return MSG_NOSIGNAL;
+#else
+    return 0;
+#endif
+}
+} // namespace
 
-TcpConnection::TcpConnection(int fd, EventLoop* loop)
-    : fd_(fd), loop_(loop) {
+TcpConnection::TcpConnection(int fd, EventLoop* loop) : fd_(fd), loop_(loop) {
+    if (fd_ < 0 || !loop_)
+        throw std::invalid_argument("invalid TcpConnection");
+#ifdef SO_NOSIGPIPE
+    const int enabled = 1;
+    (void)setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
     channel_.fd = fd_;
     channel_.interest = Event::READ;
-    channel_.on_read  = [this] { handle_read(); };
+    channel_.on_read = [this] { handle_read(); };
     channel_.on_write = [this] { handle_write(); };
 }
 
 TcpConnection::~TcpConnection() {
-    if (fd_ >= 0) {
+    if (started_ && !closed_)
+        loop_->remove_channel(&channel_);
+    if (fd_ >= 0)
         ::close(fd_);
-    }
 }
 
 void TcpConnection::start() {
+    if (started_ || closed_)
+        throw std::logic_error("connection cannot be started");
     loop_->add_channel(&channel_);
+    started_ = true;
 }
 
 void TcpConnection::send(const std::string& data) {
     send(data.data(), data.size());
 }
 
-void TcpConnection::send(const char* data, std::size_t len) {
-    if (closed_) return;
+void TcpConnection::send(const char* data, std::size_t length) {
+    if (closed_ || length == 0)
+        return;
 
-    // Try writing directly first (avoids buffering when write buffer is empty)
-    if (write_buf_.readable() == 0) {
-        ssize_t n = ::write(fd_, data, len);
-        if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    if (write_buffer_.readable() == 0) {
+        ssize_t count = ::send(fd_, data, length, send_flags());
+        if (count < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 close();
                 return;
             }
-            n = 0;
+            count = 0;
         }
-        data += n;
-        len  -= static_cast<std::size_t>(n);
+        data += count;
+        length -= static_cast<std::size_t>(count);
     }
 
-    if (len > 0) {
-        write_buf_.append(data, len);
-        // Enable WRITE event so the loop will drain the buffer
+    if (length > 0 && !closed_) {
+        write_buffer_.append(data, length);
         channel_.interest = Event::READ | Event::WRITE;
         loop_->update_channel(&channel_);
     }
 }
 
 void TcpConnection::close() {
-    if (closed_) return;
+    if (closed_)
+        return;
     closed_ = true;
-    loop_->remove_channel(&channel_);
-    if (close_cb_) close_cb_(shared_from_this());
+    if (started_) {
+        loop_->remove_channel(&channel_);
+        started_ = false;
+    }
+    if (close_callback_)
+        close_callback_(shared_from_this());
 }
 
 void TcpConnection::handle_read() {
-    // ET mode: must drain until EAGAIN
-    char tmp[4096];
+    char temporary[4096];
     for (;;) {
-        ssize_t n = ::read(fd_, tmp, sizeof(tmp));
-        if (n > 0) {
-            read_buf_.append(tmp, static_cast<std::size_t>(n));
-        } else if (n == 0) {
-            // Peer closed connection
+        const ssize_t count = ::recv(fd_, temporary, sizeof(temporary), 0);
+        if (count > 0) {
+            read_buffer_.append(temporary, static_cast<std::size_t>(count));
+        } else if (count == 0) {
             close();
             return;
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break; // no more data for now
-            }
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
             close();
             return;
         }
     }
 
-    if (read_buf_.readable() > 0 && message_cb_) {
-        message_cb_(shared_from_this(), read_buf_);
+    if (read_buffer_.readable() > 0 && message_callback_) {
+        message_callback_(shared_from_this(), read_buffer_);
     }
 }
 
 void TcpConnection::handle_write() {
-    // Drain write buffer
-    while (write_buf_.readable() > 0) {
-        ssize_t n = ::write(fd_, write_buf_.read_ptr(), write_buf_.readable());
-        if (n > 0) {
-            write_buf_.consume(static_cast<std::size_t>(n));
-        } else if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+    while (write_buffer_.readable() > 0) {
+        const ssize_t count =
+            ::send(fd_, write_buffer_.read_ptr(), write_buffer_.readable(), send_flags());
+        if (count > 0) {
+            write_buffer_.consume(static_cast<std::size_t>(count));
+        } else if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
             close();
             return;
         }
     }
 
-    if (write_buf_.readable() == 0) {
-        // Nothing left to write; stop monitoring WRITE events
+    if (!closed_ && write_buffer_.readable() == 0) {
         channel_.interest = Event::READ;
         loop_->update_channel(&channel_);
     }

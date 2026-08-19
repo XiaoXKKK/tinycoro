@@ -8,18 +8,17 @@ namespace tinycoro {
 
 // -----------------------------------------------------------------------
 // CoroutinePool — reuses Coroutine objects (and their stacks) to amortize
-// the cost of mmap/stack allocation on hot paths.
+// the cost of heap-allocated stack creation on repeated task runs.
 //
 // Each released coroutine is reset() with the next task rather than
 // being destroyed and re-created.  The pool is bounded by max_size to
 // cap memory usage.
 // -----------------------------------------------------------------------
 class CoroutinePool {
-public:
+  public:
     using Task = Coroutine::Func;
 
-    explicit CoroutinePool(std::size_t max_size = 256,
-                           std::size_t stack_size = kDefaultStackSize)
+    explicit CoroutinePool(std::size_t max_size = 256, std::size_t stack_size = kDefaultStackSize)
         : max_size_(max_size), stack_size_(stack_size) {}
 
     // Acquire a coroutine loaded with 'fn'; creates one if pool is empty
@@ -33,7 +32,7 @@ public:
         return pool_.size();
     }
 
-private:
+  private:
     std::size_t max_size_;
     std::size_t stack_size_;
     mutable std::mutex mu_;

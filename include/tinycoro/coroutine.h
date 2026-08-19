@@ -1,11 +1,13 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <ucontext.h>
 
 namespace tinycoro {
 
-// Stack size for each coroutine (128 KB default)
 static constexpr std::size_t kDefaultStackSize = 128 * 1024;
 
 enum class CoroState {
@@ -16,32 +18,27 @@ enum class CoroState {
 };
 
 class Coroutine {
-public:
+  public:
     using Func = std::function<void()>;
 
     explicit Coroutine(Func fn, std::size_t stack_size = kDefaultStackSize);
     ~Coroutine();
 
-    // Non-copyable, movable
+    // ucontext stores this object's address in the entry trampoline.
     Coroutine(const Coroutine&) = delete;
     Coroutine& operator=(const Coroutine&) = delete;
-    Coroutine(Coroutine&&) noexcept;
-    Coroutine& operator=(Coroutine&&) noexcept;
+    Coroutine(Coroutine&&) = delete;
+    Coroutine& operator=(Coroutine&&) = delete;
 
     CoroState state() const { return state_; }
     bool is_done() const { return state_ == CoroState::DEAD; }
 
-    // Resume this coroutine from caller context
     void resume();
-
-    // Yield back to caller; must be called from within the coroutine
     void yield();
-
-    // Reset with a new function (for pool reuse)
     void reset(Func fn);
 
-private:
-    static void entry(uint32_t hi, uint32_t lo);
+  private:
+    static void entry(std::uint32_t hi, std::uint32_t lo);
 
     Func fn_;
     CoroState state_{CoroState::READY};
@@ -49,6 +46,7 @@ private:
     std::unique_ptr<char[]> stack_;
     ucontext_t ctx_{};
     ucontext_t caller_ctx_{};
+    std::exception_ptr exception_{};
 };
 
 } // namespace tinycoro
