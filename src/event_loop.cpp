@@ -171,7 +171,7 @@ void EventLoop::destroy_poller() {
 namespace {
 void kqueue_ctl(int poller_fd, int fd, std::int16_t filter, std::uint16_t flags,
                 bool ignore_missing = false) {
-    kevent event{};
+    struct kevent event {};
     EV_SET(&event, fd, filter, flags, 0, 0, nullptr);
     if (kevent(poller_fd, &event, 1, nullptr, 0, nullptr) < 0) {
         if (ignore_missing && errno == ENOENT)
@@ -204,14 +204,14 @@ void EventLoop::ctl_mod(Channel* channel) {
 }
 
 void EventLoop::ctl_del(int fd) noexcept {
-    kevent changes[2]{};
+    struct kevent changes[2]{};
     EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
     EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
     (void)kevent(poller_fd_, changes, 2, nullptr, 0, nullptr);
 }
 
 int EventLoop::dispatch_events(int timeout_ms) {
-    kevent events[kMaxEvents];
+    struct kevent events[kMaxEvents];
     timespec timeout{};
     timespec* timeout_ptr = nullptr;
     if (timeout_ms >= 0) {
