@@ -7,7 +7,7 @@
 `tinycoro` is a compact C++17 learning project that connects stackful coroutines
 to a real non-blocking TCP path. A connection task issues ordinary-looking
 `read_some`/`write_all` calls; on `EAGAIN`, the runtime parks that coroutine and
-resumes it only after epoll/kqueue reports readiness or a deadline expires.
+resumes it only after epoll reports readiness or a deadline expires.
 
 The project is intentionally small enough to explain in an interview. It is not
 presented as a production networking library or as an M:N runtime.
@@ -18,8 +18,8 @@ presented as a production networking library or as an M:N runtime.
   heap-allocated stacks, and exception propagation across the context boundary.
 - A single-threaded `IoContext` with ready/waiting task states, one read and one
   write waiter per fd, and deadline management through a tokenized min-heap.
-- Edge-triggered epoll on Linux and kqueue on macOS/BSD, including EOF/error
-  wakeups and checked control operations.
+- Edge-triggered epoll on Linux, including EOF/error wakeups and checked control
+  operations.
 - RAII `TcpListener`/`TcpStream`; partial writes suspend instead of growing an
   unbounded user-space output queue, providing synchronous backpressure.
 - Coroutine echo and HTTP/1.1 examples. The incremental HTTP parser supports
@@ -28,7 +28,7 @@ presented as a production networking library or as an M:N runtime.
   concurrency exercises; they are not part of the network runtime's main path.
 - An installable `tinycoro::tinycoro` CMake target, verified by a standalone
   `find_package` consumer project.
-- 39 GoogleTest cases plus Linux ASan/UBSan, Linux Clang, and macOS CI jobs.
+- 39 GoogleTest cases plus GCC ASan/UBSan and Clang Release CI jobs on Linux.
 
 ## Main execution path
 
@@ -37,7 +37,7 @@ connection coroutine
   -> TcpStream::read_some / write_all
   -> syscall succeeds: continue on the same stack
   -> EAGAIN: IoContext records the fd waiter and yields
-  -> epoll/kqueue readiness (or deadline)
+  -> epoll readiness (or deadline)
   -> task moves back to the ready queue and resumes
 ```
 
@@ -46,6 +46,8 @@ See [architecture](docs/architecture.md) and
 ET semantics, timer invalidation, and backpressure details.
 
 ## Build and verify
+
+Requirements: Linux, a C++17 compiler, CMake 3.16+, and pthreads.
 
 ```bash
 cmake -S . -B build \
@@ -100,8 +102,8 @@ publishing a result.
 
 - The runtime is N:1 and cooperative. A blocking syscall or CPU-heavy task blocks
   every connection on that `IoContext` thread.
-- `ucontext` is obsolete POSIX API and deprecated on macOS. It is used to expose
-  stack/context mechanics; a production implementation should prefer maintained
+- `ucontext` was removed from POSIX.1-2008. It is used to expose stack/context
+  mechanics; a production implementation should prefer maintained
   context-switching code or C++20 stackless coroutines.
 - `IoContext` has no cross-thread wakeup, work stealing, cancellation token, TLS,
   or signal-safe shutdown primitive.

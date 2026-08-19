@@ -19,7 +19,7 @@ jobs:
     name: Linux GCC · ASan/UBSan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build tools
         run: sudo apt-get update -q && sudo apt-get install -y cmake ninja-build
       - name: Configure
@@ -47,7 +47,7 @@ jobs:
     name: Linux Clang · Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build tools
         run: sudo apt-get update -q && sudo apt-get install -y clang cmake ninja-build
       - name: Configure
@@ -55,19 +55,6 @@ jobs:
           CXX: clang++
         run: >-
           cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DTINYCORO_WARNINGS_AS_ERRORS=ON
-      - name: Build and test
-        run: cmake --build build --parallel && ctest --test-dir build --output-on-failure
-
-  macos:
-    name: macOS Clang · Release
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        run: >-
-          cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DTINYCORO_WARNINGS_AS_ERRORS=ON
       - name: Build and test

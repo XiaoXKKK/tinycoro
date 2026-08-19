@@ -38,8 +38,8 @@ ambiguous concurrent reads early.
 
 ## Readiness and edge-triggered I/O
 
-`EventLoop` uses `EPOLLET | EPOLLRDHUP` on Linux and `EV_CLEAR` on kqueue. Socket
-operations always attempt the syscall before registering interest. After
+`EventLoop` uses `EPOLLET | EPOLLRDHUP` on Linux. Socket operations always attempt
+the syscall before registering interest. After
 `EAGAIN`, the current task is stored in the fd's read or write wait slot and its
 coroutine yields. EOF/HUP/error events wake both relevant directions so the next
 syscall can return the authoritative result.

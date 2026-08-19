@@ -23,7 +23,6 @@ The test suite currently contains 39 cases covering:
 | --- | --- | --- |
 | Ubuntu | GCC Debug + ASan/UBSan + `-Werror` | memory/UB checks and strict warnings |
 | Ubuntu | Clang Release + `-Werror` | second compiler and optimized build |
-| macOS | Apple Clang Release + `-Werror` | kqueue and portability path |
 
 ASan documents limited support for `makecontext`/`swapcontext`; CI disables
 stack-use-after-return instrumentation but retains AddressSanitizer and

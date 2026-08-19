@@ -12,8 +12,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT UNIX)
-  message(FATAL_ERROR "tinycoro supports Linux and macOS/BSD only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "tinycoro supports Linux only")
 endif()
 
 find_package(Threads REQUIRED)
@@ -40,11 +40,6 @@ target_include_directories(tinycoro
 )
 target_link_libraries(tinycoro PUBLIC Threads::Threads)
 target_compile_features(tinycoro PUBLIC cxx_std_17)
-
-if(APPLE)
-  target_compile_definitions(tinycoro PUBLIC _XOPEN_SOURCE=600)
-  target_compile_options(tinycoro PRIVATE -Wno-deprecated-declarations)
-endif()
 
 function(tinycoro_configure_target target)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

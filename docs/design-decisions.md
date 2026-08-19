@@ -6,7 +6,7 @@ The project uses stackful coroutines to make suspension mechanics visible:
 register state, an independent stack, caller/callee contexts, and the constraint
 that the coroutine object cannot move after `makecontext` embeds its address.
 This is educational rather than a production recommendation. `ucontext` was
-removed from POSIX.1-2008 and is deprecated on macOS.
+removed from POSIX.1-2008.
 
 A C++20 version would model readiness through awaiters and avoid a fixed stack
 per connection. It would also require explicit lifetime handling for coroutine
