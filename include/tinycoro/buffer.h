@@ -1,78 +1,81 @@
 #pragma once
 #include <cstddef>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace tinycoro {
 
-// Ring-buffer read/write buffer.
-// Avoids data copying on sequential reads by tracking head/tail positions.
+// Contiguous read/write buffer with independent read and write cursors.
+// It compacts or grows only when the tail has insufficient writable space.
 class Buffer {
-public:
+  public:
     static constexpr std::size_t kInitialSize = 4096;
 
     explicit Buffer(std::size_t initial = kInitialSize)
         : buf_(initial), read_idx_(0), write_idx_(0) {}
 
-    // Readable bytes
     std::size_t readable() const { return write_idx_ - read_idx_; }
-
-    // Writable bytes remaining without reallocation
     std::size_t writable() const { return buf_.size() - write_idx_; }
 
     const char* read_ptr() const { return buf_.data() + read_idx_; }
-    char* write_ptr()            { return buf_.data() + write_idx_; }
+    char* write_ptr() { return buf_.data() + write_idx_; }
 
-    // Append raw bytes into the write area; grows if needed
+    // Commit bytes written directly into write_ptr().
+    void has_written(std::size_t n) {
+        if (n > writable())
+            throw std::out_of_range("Buffer::has_written");
+        write_idx_ += n;
+    }
+
     void append(const char* data, std::size_t len) {
         ensure_writable(len);
         std::memcpy(write_ptr(), data, len);
         write_idx_ += len;
     }
 
-    void append(const std::string& s) { append(s.data(), s.size()); }
+    void append(const std::string& data) { append(data.data(), data.size()); }
 
-    // Consume n bytes from read side
     void consume(std::size_t n) {
+        if (n > readable())
+            throw std::out_of_range("Buffer::consume");
         read_idx_ += n;
         if (read_idx_ == write_idx_) {
-            // Reset to front of buffer to avoid perpetual growth
             read_idx_ = write_idx_ = 0;
         }
     }
 
-    // Retrieve all readable data as a string
     std::string retrieve_all_as_string() {
-        std::string s(read_ptr(), readable());
+        std::string result(read_ptr(), readable());
         consume(readable());
-        return s;
+        return result;
     }
 
-    // Find "\r\n" in readable region; returns offset or npos
     std::size_t find_crlf() const {
-        const char* p = read_ptr();
-        std::size_t n = readable();
-        for (std::size_t i = 0; i + 1 < n; ++i) {
-            if (p[i] == '\r' && p[i+1] == '\n') return i;
+        const char* data = read_ptr();
+        const std::size_t size = readable();
+        for (std::size_t i = 0; i + 1 < size; ++i) {
+            if (data[i] == '\r' && data[i + 1] == '\n')
+                return i;
         }
         return std::string::npos;
     }
 
     void ensure_writable(std::size_t len) {
-        if (writable() >= len) return;
-        // Try compacting first
+        if (writable() >= len)
+            return;
         if (read_idx_ + writable() >= len) {
-            std::size_t r = readable();
-            std::memmove(buf_.data(), read_ptr(), r);
+            const std::size_t size = readable();
+            std::memmove(buf_.data(), read_ptr(), size);
             read_idx_ = 0;
-            write_idx_ = r;
+            write_idx_ = size;
         } else {
             buf_.resize(write_idx_ + len);
         }
     }
 
-private:
+  private:
     std::vector<char> buf_;
     std::size_t read_idx_;
     std::size_t write_idx_;

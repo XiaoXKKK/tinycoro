@@ -1,12 +1,22 @@
-#include "tinycoro/thread_pool.h"
 #include "tinycoro/coroutine_pool.h"
-#include <gtest/gtest.h>
+#include "tinycoro/thread_pool.h"
 #include <atomic>
 #include <chrono>
+#include <gtest/gtest.h>
 
 using namespace tinycoro;
 
 // ---- ThreadPool --------------------------------------------------------
+
+TEST(ThreadPoolTest, RejectsZeroWorkers) {
+    EXPECT_THROW(ThreadPool pool(0), std::invalid_argument);
+}
+
+TEST(ThreadPoolTest, RejectsSubmitAfterShutdown) {
+    ThreadPool pool(1);
+    pool.shutdown();
+    EXPECT_FALSE(pool.submit([] {}));
+}
 
 TEST(ThreadPoolTest, SubmitAndExecute) {
     ThreadPool pool(2);
@@ -14,9 +24,8 @@ TEST(ThreadPoolTest, SubmitAndExecute) {
 
     constexpr int N = 100;
     for (int i = 0; i < N; ++i) {
-        while (!pool.submit([&] {
-            counter.fetch_add(1, std::memory_order_relaxed);
-        })) {}
+        while (!pool.submit([&] { counter.fetch_add(1, std::memory_order_relaxed); })) {
+        }
     }
 
     // Give workers time to drain
@@ -30,9 +39,8 @@ TEST(ThreadPoolTest, ConcurrentSubmit) {
     constexpr int N = 1000;
 
     for (int i = 0; i < N; ++i) {
-        while (!pool.submit([&, i] {
-            sum.fetch_add(i, std::memory_order_relaxed);
-        })) {}
+        while (!pool.submit([&, i] { sum.fetch_add(i, std::memory_order_relaxed); })) {
+        }
     }
 
     pool.shutdown();

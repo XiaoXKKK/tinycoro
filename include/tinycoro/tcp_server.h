@@ -1,44 +1,47 @@
 #pragma once
 #include "tinycoro/event_loop.h"
 #include "tinycoro/tcp_connection.h"
+#include <cstdint>
 #include <functional>
-#include <string>
 #include <unordered_map>
 
 namespace tinycoro {
 
 using ConnectionCallback = std::function<void(TcpConnectionPtr)>;
 
-// -----------------------------------------------------------------------
-// TcpServer — listens on a port, accepts connections, and wires each
-// connection into the EventLoop with user-provided callbacks.
-// -----------------------------------------------------------------------
+// Callback-based TCP server used by the Reactor examples.
 class TcpServer {
-public:
-    TcpServer(EventLoop* loop, uint16_t port);
+  public:
+    TcpServer(EventLoop* loop, std::uint16_t port);
     ~TcpServer();
 
-    void set_connection_callback(ConnectionCallback cb) { conn_cb_ = std::move(cb); }
-    void set_message_callback(MessageCallback cb)       { msg_cb_  = std::move(cb); }
+    TcpServer(const TcpServer&) = delete;
+    TcpServer& operator=(const TcpServer&) = delete;
 
-    // Start accepting; registers listen socket into the EventLoop
+    void set_connection_callback(ConnectionCallback callback) {
+        connection_callback_ = std::move(callback);
+    }
+    void set_message_callback(MessageCallback callback) { message_callback_ = std::move(callback); }
+    void set_close_callback(ConnectionCallback callback) { close_callback_ = std::move(callback); }
+
     void start();
 
-private:
+  private:
     void handle_accept();
-    void handle_close(TcpConnectionPtr conn);
+    void handle_close(TcpConnectionPtr connection);
 
-    static int create_listen_fd(uint16_t port);
+    static int create_listen_fd(std::uint16_t port);
     static void set_nonblocking(int fd);
     static void set_reuse_addr(int fd);
 
     EventLoop* loop_;
-    uint16_t port_;
+    std::uint16_t port_;
     int listen_fd_{-1};
+    bool started_{false};
     Channel accept_channel_;
-
-    ConnectionCallback conn_cb_;
-    MessageCallback    msg_cb_;
+    ConnectionCallback connection_callback_;
+    ConnectionCallback close_callback_;
+    MessageCallback message_callback_;
     std::unordered_map<int, TcpConnectionPtr> connections_;
 };
 

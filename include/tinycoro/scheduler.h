@@ -2,15 +2,15 @@
 #include "tinycoro/coroutine.h"
 #include <functional>
 #include <memory>
-#include <vector>
 #include <queue>
+#include <vector>
 
 namespace tinycoro {
 
 // Single-thread cooperative scheduler.
 // Run-to-yield semantics: each spawned coroutine runs until it yields or finishes.
 class Scheduler {
-public:
+  public:
     using Task = std::function<void()>;
 
     Scheduler() = default;
@@ -29,7 +29,7 @@ public:
     // Returns the currently running coroutine (nullptr if called from main thread)
     static Coroutine* current();
 
-private:
+  private:
     void schedule_next();
 
     std::queue<std::unique_ptr<Coroutine>> ready_queue_;

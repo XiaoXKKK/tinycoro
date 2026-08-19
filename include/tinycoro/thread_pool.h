@@ -13,7 +13,7 @@ namespace tinycoro {
 // briefly then yield the OS thread (avoids syscall on high load).
 // -----------------------------------------------------------------------
 class ThreadPool {
-public:
+  public:
     using Task = std::function<void()>;
     static constexpr std::size_t kQueueSize = 4096;
 
@@ -31,7 +31,7 @@ public:
 
     void shutdown();
 
-private:
+  private:
     void worker_loop();
 
     MPMCQueue<Task, kQueueSize> queue_;

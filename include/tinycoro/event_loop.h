@@ -1,25 +1,23 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include <unordered_map>
-#include <vector>
-#include <cstdint>
 
 namespace tinycoro {
 
-// Event types (bitmask)
-enum class Event : uint32_t {
-    READ  = 0x1,
+enum class Event : std::uint32_t {
+    READ = 0x1,
     WRITE = 0x2,
 };
 
-inline Event operator|(Event a, Event b) {
-    return static_cast<Event>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
-}
-inline bool operator&(Event a, Event b) {
-    return (static_cast<uint32_t>(a) & static_cast<uint32_t>(b)) != 0;
+inline Event operator|(Event lhs, Event rhs) {
+    return static_cast<Event>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
 }
 
-// Channel: binds a file descriptor to read/write callbacks.
+inline bool operator&(Event lhs, Event rhs) {
+    return (static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs)) != 0;
+}
+
 struct Channel {
     int fd{-1};
     std::function<void()> on_read;
@@ -27,45 +25,35 @@ struct Channel {
     Event interest{Event::READ};
 };
 
-// EventLoop: wraps epoll (Linux) or kqueue (macOS) with Edge-Triggered mode.
-// Not thread-safe — intended to be driven by a single thread.
+// Single-threaded edge-triggered readiness loop.
 class EventLoop {
-public:
+  public:
     EventLoop();
     ~EventLoop();
 
-    // Non-copyable
     EventLoop(const EventLoop&) = delete;
     EventLoop& operator=(const EventLoop&) = delete;
 
-    // Add/update/remove fd interest
-    void add_channel(Channel* ch);
-    void update_channel(Channel* ch);
-    void remove_channel(Channel* ch);
+    void add_channel(Channel* channel);
+    void update_channel(Channel* channel);
+    void remove_channel(Channel* channel);
 
-    // Wait for events (timeout_ms = -1 → block indefinitely)
-    // Dispatches callbacks for all ready events.
     void poll(int timeout_ms = 0);
-
-    // Run the loop forever (until stop() is called)
     void run();
-
     void stop();
 
     bool running() const { return running_; }
 
-private:
-    int poller_fd_{-1};  // epoll fd or kqueue fd
+  private:
+    int poller_fd_{-1};
     bool running_{false};
     std::unordered_map<int, Channel*> channels_;
 
-    // Platform-specific helpers
     void init_poller();
     void destroy_poller();
-    void ctl_add(Channel* ch);
-    void ctl_mod(Channel* ch);
-    void ctl_del(int fd);
-    // Dispatch up to max_events ready events; returns number dispatched
+    void ctl_add(Channel* channel);
+    void ctl_mod(Channel* channel);
+    void ctl_del(int fd) noexcept;
     int dispatch_events(int timeout_ms);
 };
 

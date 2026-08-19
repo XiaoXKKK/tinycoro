@@ -21,7 +21,8 @@ std::unique_ptr<Coroutine> CoroutinePool::acquire(Task fn) {
 }
 
 void CoroutinePool::release(std::unique_ptr<Coroutine> coro) {
-    if (!coro || !coro->is_done()) return;
+    if (!coro || !coro->is_done())
+        return;
 
     std::lock_guard<std::mutex> lk(mu_);
     if (pool_.size() < max_size_) {
