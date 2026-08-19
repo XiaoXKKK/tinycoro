@@ -2,9 +2,11 @@
 #include "tinycoro/io_context.h"
 #include "tinycoro/tcp_stream.h"
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,6 +45,20 @@ struct SocketPair {
     }
 };
 
+void fill_send_buffer(int fd) {
+    const char data[4096]{};
+    for (;;) {
+        const ssize_t count = ::send(fd, data, sizeof(data), MSG_NOSIGNAL);
+        if (count > 0)
+            continue;
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        throw std::runtime_error("failed to fill socket send buffer");
+    }
+}
+
 } // namespace
 
 TEST(IoContextTest, CooperativeYieldIsFifo) {
@@ -80,6 +96,36 @@ TEST(IoContextTest, ReadableEventResumesSuspendedCoroutine) {
     context.run();
     EXPECT_EQ(result.status, IoStatus::Ok);
     EXPECT_EQ(input.retrieve_all_as_string(), "ready");
+}
+
+TEST(IoContextTest, ReadAndWriteWaitersCanShareOneFd) {
+    SocketPair sockets;
+    int send_buffer = 4096;
+    ASSERT_EQ(setsockopt(sockets.fd[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)),
+              0);
+
+    IoContext context;
+    auto stream = std::make_shared<TcpStream>(context, sockets.release(0));
+    fill_send_buffer(stream->native_handle());
+
+    Buffer input;
+    IoResult read_result;
+    IoResult write_result;
+
+    context.spawn([&] { read_result = stream->read_some(input, 8, 500ms); });
+    context.spawn([&] { write_result = stream->write_all("w", 500ms); });
+    context.spawn([&] {
+        ASSERT_EQ(::send(sockets.fd[1], "r", 1, MSG_NOSIGNAL), 1);
+        char drained[64 * 1024];
+        ASSERT_GT(::recv(sockets.fd[1], drained, sizeof(drained), 0), 0);
+    });
+
+    context.run();
+
+    EXPECT_EQ(read_result.status, IoStatus::Ok);
+    EXPECT_EQ(write_result.status, IoStatus::Ok);
+    EXPECT_EQ(write_result.bytes, 1u);
+    EXPECT_EQ(input.retrieve_all_as_string(), "r");
 }
 
 TEST(IoContextTest, ReadDeadlineExpiresWithoutBusyPolling) {
@@ -191,6 +237,31 @@ TEST(IoContextTest, ClosingStreamCancelsSuspendedRead) {
 
     context.run();
     EXPECT_EQ(result.status, IoStatus::Closed);
+}
+
+TEST(IoContextTest, ClosingStreamCancelsReadAndWriteWaiters) {
+    SocketPair sockets;
+    int send_buffer = 4096;
+    ASSERT_EQ(setsockopt(sockets.fd[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)),
+              0);
+
+    IoContext context;
+    auto stream = std::make_shared<TcpStream>(context, sockets.release(0));
+    fill_send_buffer(stream->native_handle());
+
+    Buffer input;
+    IoResult read_result;
+    IoResult write_result;
+
+    context.spawn([&] { read_result = stream->read_some(input, 8, 1s); });
+    context.spawn([&] { write_result = stream->write_all("w", 1s); });
+    context.spawn([&] { stream->close(); });
+
+    context.run();
+
+    EXPECT_EQ(read_result.status, IoStatus::Closed);
+    EXPECT_EQ(write_result.status, IoStatus::Closed);
+    EXPECT_FALSE(stream->is_open());
 }
 
 TEST(IoContextTest, TaskExceptionsReturnToCaller) {

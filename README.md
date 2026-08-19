@@ -28,7 +28,7 @@ presented as a production networking library or as an M:N runtime.
   concurrency exercises; they are not part of the network runtime's main path.
 - An installable `tinycoro::tinycoro` CMake target, verified by a standalone
   `find_package` consumer project.
-- 39 GoogleTest cases plus GCC ASan/UBSan and Clang Release CI jobs on Linux.
+- 45 GoogleTest cases plus GCC ASan/UBSan and Clang Release CI jobs on Linux.
 
 ## Main execution path
 

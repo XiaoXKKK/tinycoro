@@ -74,3 +74,8 @@ Exceptions must not unwind across a C `makecontext` trampoline. `Coroutine::entr
 captures `exception_ptr`, switches back to the caller, and `resume()` rethrows on
 the normal C++ stack. `IoContext` erases the failed task before propagating the
 exception from `run()`.
+
+The callback Reactor comparison is also fail-fast: internal setup errors and
+exceptions from user callbacks propagate to the `EventLoop::poll`/`run` caller
+after owned descriptors are cleaned up. Applications that choose the callback
+API define their own logging, retry, or shutdown policy at that loop boundary.

@@ -2,17 +2,18 @@
 
 ## Automated coverage
 
-The test suite currently contains 39 cases covering:
+The test suite currently contains 45 cases covering:
 
 - coroutine completion, repeated yield/resume, stack reuse, and exception
   propagation across the context trampoline;
 - bounded SPSC and sequence-number MPMC queues under concurrent producers and
   consumers;
 - buffer cursor bounds, compaction/growth behavior, fragmented HTTP input,
-  pipelining, conflicting `Content-Length`, unsupported transfer encoding, and
-  request/body limits;
-- `IoContext` FIFO scheduling, readable wakeup, deadline expiry, cancellation,
-  a forced 1 MiB partial-write/backpressure path, and a real TCP loopback echo;
+  pipelining, strict request lines, ambiguous body framing, exact size-limit
+  boundaries, and configured request/header/body limits;
+- `IoContext` FIFO scheduling, dual-direction waiters and cancellation on one fd,
+  deadline expiry, a forced 1 MiB partial-write/backpressure path, and a real TCP
+  loopback echo;
 - coroutine pool bounds and thread-pool shutdown/drain behavior.
 
 `gtest_discover_tests` registers every case separately with CTest.

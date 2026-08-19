@@ -25,6 +25,11 @@ An M:N extension would need per-worker pollers or a cross-thread wakeup fd,
 work-stealing/affinity policy, migration rules for fd ownership, shutdown and
 cancellation semantics, and tests for races across those boundaries.
 
+`IoContext::yield()` always requeues its running task, so CPU-only cooperative
+tasks are supported. If tasks remain after the ready queue drains but no fd or
+timer can wake them, `run()` throws instead of blocking forever; that condition
+is treated as a scheduler-invariant violation rather than a normal idle state.
+
 ## Why one waiter per fd direction?
 
 Concurrent reads on one byte stream have ambiguous message ownership. Allowing

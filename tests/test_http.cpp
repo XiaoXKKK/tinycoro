@@ -132,6 +132,45 @@ TEST(HttpParserTest, UnsupportedChunkedEncodingIsRejected) {
     EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
 }
 
+TEST(HttpParserTest, IdentityTransferEncodingWithContentLengthIsAccepted) {
+    HttpParser parser;
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Content-Length: 4\r\n"
+                  "Transfer-Encoding: identity\r\n\r\n"
+                  "body");
+
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
+    EXPECT_EQ(parser.request().body, "body");
+}
+
+TEST(HttpParserTest, ChunkedEncodingWithContentLengthIsRejected) {
+    HttpParser parser;
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Content-Length: 4\r\n"
+                  "Transfer-Encoding: chunked\r\n\r\n"
+                  "body");
+
+    EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+}
+
+TEST(HttpParserTest, StrictRequestLineRejectsUnsupportedForms) {
+    const char* invalid_requests[] = {
+        "GET / HTTP/2.0\r\n\r\n",
+        "GET / HTTP/1.x\r\n\r\n",
+        "GET / HTTP/1.1 EXTRA\r\n\r\n",
+    };
+
+    for (const char* request : invalid_requests) {
+        SCOPED_TRACE(request);
+        HttpParser parser;
+        Buffer buffer;
+        buffer.append(request);
+        EXPECT_EQ(parser.parse(buffer), HttpParser::ERROR);
+    }
+}
+
 TEST(HttpParserTest, ConfiguredLimitsBoundMemoryGrowth) {
     HttpParser::Limits limits;
     limits.request_line_bytes = 16;
@@ -148,4 +187,19 @@ TEST(HttpParserTest, ConfiguredLimitsBoundMemoryGrowth) {
                 "Content-Length: 5\r\n\r\n"
                 "12345");
     EXPECT_EQ(parser.parse(body), HttpParser::ERROR);
+}
+
+TEST(HttpParserTest, ConfiguredLimitsAcceptExactBoundaries) {
+    HttpParser::Limits limits;
+    limits.request_line_bytes = 15;
+    limits.header_bytes = 21;
+    limits.body_bytes = 4;
+    HttpParser parser(limits);
+    Buffer buffer;
+    buffer.append("POST / HTTP/1.1\r\n"
+                  "Content-Length: 4\r\n\r\n"
+                  "body");
+
+    EXPECT_EQ(parser.parse(buffer), HttpParser::COMPLETE);
+    EXPECT_EQ(parser.request().body, "body");
 }
