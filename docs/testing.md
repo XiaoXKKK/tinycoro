@@ -2,21 +2,25 @@
 
 ## Automated coverage
 
-The test suite currently contains 45 cases covering:
+The current suite contains 44 GoogleTest cases, each registered separately with
+CTest:
 
-- coroutine completion, repeated yield/resume, stack reuse, and exception
-  propagation across the context trampoline;
-- bounded SPSC and sequence-number MPMC queues under concurrent producers and
-  consumers;
-- buffer cursor bounds, compaction/growth behavior, fragmented HTTP input,
-  pipelining, strict request lines, ambiguous body framing, exact size-limit
-  boundaries, and configured request/header/body limits;
-- `IoContext` FIFO scheduling, dual-direction waiters and cancellation on one fd,
-  deadline expiry, a forced 1 MiB partial-write/backpressure path, and a real TCP
-  loopback echo;
-- coroutine pool bounds and thread-pool shutdown/drain behavior.
+- 7 task/runtime cases: lazy start, nested values, FIFO yield scheduling, root
+  and nested exception propagation, empty-task rejection, and destruction of
+  suspended frames;
+- 7 buffer cases for cursor bounds, compaction/growth, and direct-write commit;
+- 12 HTTP parser cases covering fragmentation, pipelining, strict request lines,
+  framing ambiguity, transfer-encoding rejection, and exact configured limits;
+- 8 I/O cases covering readable resumption, simultaneous read/write waiters,
+  deadlines, a forced 1 MiB partial-write path, real loopback accept/echo, and
+  close cancellation for listeners and streams;
+- 5 thread-pool cases covering invalid construction, shutdown rejection, drain,
+  concurrent submission with exactly-once IDs, and exception retention;
+- 5 queue cases, including ordered SPSC delivery and MPMC exactly-once validation
+  for every produced ID rather than a checksum-only assertion.
 
-`gtest_discover_tests` registers every case separately with CTest.
+Passing these tests supports the implemented ownership and state transitions; it
+does not prove production readiness.
 
 ## CI matrix
 
@@ -25,28 +29,36 @@ The test suite currently contains 45 cases covering:
 | Ubuntu | GCC Debug + ASan/UBSan + `-Werror` | memory/UB checks and strict warnings |
 | Ubuntu | Clang Release + `-Werror` | second compiler and optimized build |
 
-ASan documents limited support for `makecontext`/`swapcontext`; CI disables
-stack-use-after-return instrumentation but retains AddressSanitizer and
-UndefinedBehaviorSanitizer for the surrounding C++ code.
+The GCC job also performs a clean, non-sanitized install and builds a standalone
+C++20 consumer through `find_package(tinycoro CONFIG REQUIRED)`. That consumer
+creates an `IoContext`, spawns a `Task<void>`, and runs it, so package verification
+exercises compiled runtime symbols rather than a header-only helper.
 
 ## Local commands
 
 ```bash
-cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DTINYCORO_ENABLE_SANITIZERS=ON \
-  -DTINYCORO_WARNINGS_AS_ERRORS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DTINYCORO_ENABLE_SANITIZERS=ON -DTINYCORO_WARNINGS_AS_ERRORS=ON
 cmake --build build --parallel
-ASAN_OPTIONS=detect_stack_use_after_return=0 \
-  ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure
 ```
 
-A Release smoke check should start `coro_http_echo`, send a POST with `curl`,
-and verify the exact response shown in the root README.
+For the installed-package check:
+
+```bash
+cmake -S . -B package-build -DCMAKE_BUILD_TYPE=Release -DTINYCORO_BUILD_EXAMPLES=OFF -DTINYCORO_BUILD_TESTS=OFF
+cmake --build package-build --parallel
+cmake --install package-build --prefix /tmp/tinycoro-install
+cmake -S tests/package_consumer -B package-consumer -DCMAKE_PREFIX_PATH=/tmp/tinycoro-install
+cmake --build package-consumer --parallel
+./package-consumer/package_consumer
+```
+
+A Release smoke test should start `http_echo`, issue the POST shown in the root
+README, verify the exact response body, and then stop the server.
 
 ## Important gaps
 
-Passing this suite does not prove production readiness. Missing evidence includes
-fuzzing, ThreadSanitizer coverage, long-running connection churn, fd exhaustion,
-TLS/protocol conformance, cross-thread cancellation, slowloris behavior, and a
-fixed-hardware network benchmark.
+Current evidence does not include fuzzing, ThreadSanitizer, long-running connection
+churn, fd exhaustion/fault injection, slowloris limits, TLS/protocol conformance,
+cross-thread context wakeup, or a fixed-hardware network benchmark. The HTTP
+parser intentionally does not implement chunked transfer decoding.

@@ -1,28 +1,61 @@
 #include "tinycoro/io_context.h"
 #include <climits>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 
 namespace tinycoro {
 
-IoContext::~IoContext() {
-    for (auto& entry : fd_states_) {
-        if (entry.second->registered) {
-            loop_.remove_channel(&entry.second->channel);
-        }
-    }
-    fd_states_.clear();
-    tasks_.clear();
+void IoContext::FdAwaiter::await_suspend(std::coroutine_handle<> continuation) {
+    context_->arm_wait(fd_, event_, timeout_, continuation, &ready_);
 }
 
-void IoContext::spawn(Task task) {
-    if (!task)
-        throw std::invalid_argument("IoContext::spawn requires a task");
-    const TaskId id = next_task_++;
-    TaskRecord record;
-    record.coroutine = std::make_unique<Coroutine>(std::move(task));
-    tasks_.emplace(id, std::move(record));
-    ready_.push_back(id);
+void IoContext::YieldAwaiter::await_suspend(std::coroutine_handle<> continuation) {
+    context_->schedule(continuation);
+}
+
+IoContext::~IoContext() {
+    for (auto& [fd, state] : fd_states_) {
+        (void)fd;
+        if (state->registered)
+            loop_.remove_channel(&state->channel);
+    }
+    fd_states_.clear();
+    ready_.clear();
+    completed_head_ = {};
+    timers_ = {};
+
+    auto roots = std::move(roots_);
+    roots_.clear();
+    for (auto& [address, handle] : roots) {
+        (void)address;
+        if (handle)
+            handle.destroy();
+    }
+}
+
+void IoContext::spawn(Task<void> task) {
+    if (!task.valid())
+        throw std::invalid_argument("IoContext::spawn requires a valid Task");
+
+    RootHandle handle = task.release();
+    auto& promise = handle.promise();
+    promise.completion_context = this;
+    promise.completion = &IoContext::notify_root_completed;
+
+    try {
+        const auto [iterator, inserted] = roots_.emplace(handle.address(), handle);
+        (void)iterator;
+        if (!inserted)
+            throw std::logic_error("IoContext already owns this Task");
+        ready_.push_back(handle);
+    } catch (...) {
+        roots_.erase(handle.address());
+        promise.completion_context = nullptr;
+        promise.completion = nullptr;
+        handle.destroy();
+        throw;
+    }
 }
 
 void IoContext::run() {
@@ -32,150 +65,137 @@ void IoContext::run() {
     stop_requested_ = false;
 
     try {
-        while (!stop_requested_ && !tasks_.empty()) {
+        while (!stop_requested_ && !roots_.empty()) {
             run_ready();
             expire_timers();
-            if (stop_requested_ || tasks_.empty())
+            if (stop_requested_ || roots_.empty())
                 break;
             if (!ready_.empty())
                 continue;
+
             const int poll_timeout = next_poll_timeout();
             if (poll_timeout < 0 && !has_registered_waiter()) {
-                throw std::logic_error("IoContext task has no wake source");
+                throw std::logic_error("IoContext Task has no readiness or timer wake source");
             }
             loop_.poll(poll_timeout);
             expire_timers();
         }
     } catch (...) {
-        current_task_ = 0;
         running_ = false;
         throw;
     }
 
-    current_task_ = 0;
     running_ = false;
 }
 
-void IoContext::stop() {
+void IoContext::stop() noexcept {
     stop_requested_ = true;
 }
 
-void IoContext::yield() {
-    if (current_task_ == 0) {
-        throw std::logic_error("IoContext::yield called outside a task");
-    }
-    auto it = tasks_.find(current_task_);
-    if (it == tasks_.end() || it->second.state != TaskState::Running) {
-        throw std::logic_error("IoContext task is not running");
-    }
-    it->second.state = TaskState::Ready;
-    ready_.push_back(current_task_);
-    it->second.coroutine->yield();
-}
-
-bool IoContext::wait_readable(int fd, Duration timeout) {
-    return wait_fd(fd, Event::READ, timeout);
-}
-
-bool IoContext::wait_writable(int fd, Duration timeout) {
-    return wait_fd(fd, Event::WRITE, timeout);
-}
-
-bool IoContext::wait_fd(int fd, Event event, Duration timeout) {
-    if (fd < 0)
-        throw std::invalid_argument("cannot wait on an invalid fd");
-    if (current_task_ == 0) {
-        throw std::logic_error("fd wait called outside an IoContext task");
-    }
-
-    auto task_it = tasks_.find(current_task_);
-    if (task_it == tasks_.end() || task_it->second.state != TaskState::Running) {
-        throw std::logic_error("IoContext task is not running");
-    }
-
-    FdState& state = fd_state(fd);
-    auto& wait_slot = slot(state, event);
-    if (wait_slot) {
-        throw std::logic_error("fd already has a waiter for this direction");
-    }
-
-    bool ready = false;
-    const std::uint64_t token = next_token_++;
-    wait_slot = WaitSlot{current_task_, token, &ready};
-    refresh_interest(state);
-
-    if (timeout >= Duration::zero()) {
-        timers_.push(TimerEntry{Clock::now() + timeout, token, fd, event});
-    }
-
-    Coroutine* coroutine = task_it->second.coroutine.get();
-    task_it->second.state = TaskState::Waiting;
-    coroutine->yield();
-    return ready;
-}
-
 void IoContext::cancel(int fd) {
-    auto it = fd_states_.find(fd);
-    if (it == fd_states_.end())
+    auto iterator = fd_states_.find(fd);
+    if (iterator == fd_states_.end())
         return;
 
-    FdState& state = *it->second;
+    FdState& state = *iterator->second;
     if (state.registered) {
         loop_.remove_channel(&state.channel);
         state.registered = false;
     }
     complete(state.reader, false);
     complete(state.writer, false);
-    fd_states_.erase(it);
+    fd_states_.erase(iterator);
+}
+
+void IoContext::notify_root_completed(void* context, std::coroutine_handle<> handle) noexcept {
+    static_cast<IoContext*>(context)->root_completed(handle);
+}
+
+void IoContext::root_completed(std::coroutine_handle<> handle) noexcept {
+    RootHandle root = RootHandle::from_address(handle.address());
+    root.promise().completed_next = completed_head_;
+    completed_head_ = handle;
+}
+
+void IoContext::drain_completed() {
+    std::exception_ptr first_error;
+    while (completed_head_) {
+        RootHandle root = RootHandle::from_address(completed_head_.address());
+        completed_head_ = root.promise().completed_next;
+        roots_.erase(root.address());
+        if (!first_error && root.promise().exception)
+            first_error = root.promise().exception;
+        root.destroy();
+    }
+    if (first_error)
+        std::rethrow_exception(first_error);
+}
+
+void IoContext::schedule(std::coroutine_handle<> continuation) {
+    if (!continuation || continuation.done())
+        return;
+    ready_.push_back(continuation);
 }
 
 void IoContext::run_ready() {
     while (!ready_.empty() && !stop_requested_) {
-        const TaskId id = ready_.front();
+        const std::coroutine_handle<> continuation = ready_.front();
         ready_.pop_front();
-        auto it = tasks_.find(id);
-        if (it == tasks_.end() || it->second.state != TaskState::Ready)
+        if (!continuation || continuation.done())
             continue;
-
-        it->second.state = TaskState::Running;
-        current_task_ = id;
-        try {
-            it->second.coroutine->resume();
-        } catch (...) {
-            current_task_ = 0;
-            tasks_.erase(id);
-            throw;
-        }
-        current_task_ = 0;
-
-        it = tasks_.find(id);
-        if (it == tasks_.end())
-            continue;
-        if (it->second.coroutine->is_done()) {
-            tasks_.erase(it);
-        } else if (it->second.state == TaskState::Running) {
-            // A raw Coroutine::yield() is treated as a cooperative yield.
-            it->second.state = TaskState::Ready;
-            ready_.push_back(id);
-        }
+        continuation.resume();
+        drain_completed();
     }
 }
 
-void IoContext::wake(TaskId task) {
-    auto it = tasks_.find(task);
-    if (it == tasks_.end() || it->second.state != TaskState::Waiting)
-        return;
-    it->second.state = TaskState::Ready;
-    ready_.push_back(task);
+void IoContext::arm_wait(int fd, Event event, Duration timeout,
+                         std::coroutine_handle<> continuation, bool* result) {
+    if (fd < 0)
+        throw std::invalid_argument("cannot wait on an invalid fd");
+    if (!continuation || continuation.done())
+        throw std::logic_error("cannot register an invalid coroutine continuation");
+    if (!result)
+        throw std::invalid_argument("fd wait requires result storage");
+
+    FdState& state = fd_state(fd);
+    auto& wait_slot = slot(state, event);
+    if (wait_slot)
+        throw std::logic_error("fd already has a waiter for this direction");
+
+    *result = false;
+    const std::uint64_t token = next_token_++;
+    wait_slot = WaitSlot{continuation, token, result};
+
+    try {
+        refresh_interest(state);
+        if (timeout >= Duration::zero())
+            timers_.push(TimerEntry{Clock::now() + timeout, token, fd, event});
+    } catch (...) {
+        wait_slot.reset();
+        if (!state.reader && !state.writer) {
+            if (state.registered)
+                loop_.remove_channel(&state.channel);
+            fd_states_.erase(fd);
+        } else {
+            try {
+                refresh_interest(state);
+            } catch (...) {
+            }
+        }
+        throw;
+    }
 }
 
 void IoContext::on_ready(int fd, Event event) {
-    auto it = fd_states_.find(fd);
-    if (it == fd_states_.end())
+    auto iterator = fd_states_.find(fd);
+    if (iterator == fd_states_.end())
         return;
-    FdState& state = *it->second;
+
+    FdState& state = *iterator->second;
     complete(slot(state, event), true);
     refresh_interest(state);
+    if (!state.reader && !state.writer)
+        fd_states_.erase(iterator);
 }
 
 void IoContext::complete(std::optional<WaitSlot>& wait_slot, bool result) {
@@ -183,9 +203,8 @@ void IoContext::complete(std::optional<WaitSlot>& wait_slot, bool result) {
         return;
     const WaitSlot completed = *wait_slot;
     wait_slot.reset();
-    if (completed.result)
-        *completed.result = result;
-    wake(completed.task);
+    *completed.result = result;
+    schedule(completed.continuation);
 }
 
 void IoContext::refresh_interest(FdState& state) {
@@ -214,14 +233,18 @@ void IoContext::refresh_interest(FdState& state) {
 }
 
 IoContext::FdState& IoContext::fd_state(int fd) {
-    auto [it, inserted] = fd_states_.try_emplace(fd);
-    if (inserted) {
-        it->second = std::make_unique<FdState>();
-        it->second->channel.fd = fd;
-        it->second->channel.on_read = [this, fd] { on_ready(fd, Event::READ); };
-        it->second->channel.on_write = [this, fd] { on_ready(fd, Event::WRITE); };
-    }
-    return *it->second;
+    const auto existing = fd_states_.find(fd);
+    if (existing != fd_states_.end())
+        return *existing->second;
+
+    auto state = std::make_unique<FdState>();
+    state->channel.fd = fd;
+    state->channel.on_read = [this, fd] { on_ready(fd, Event::READ); };
+    state->channel.on_write = [this, fd] { on_ready(fd, Event::WRITE); };
+
+    auto [iterator, inserted] = fd_states_.emplace(fd, std::move(state));
+    (void)inserted;
+    return *iterator->second;
 }
 
 std::optional<IoContext::WaitSlot>& IoContext::slot(FdState& state, Event event) {
@@ -233,10 +256,10 @@ const std::optional<IoContext::WaitSlot>& IoContext::slot(const FdState& state, 
 }
 
 bool IoContext::timer_active(const TimerEntry& timer) const {
-    auto it = fd_states_.find(timer.fd);
-    if (it == fd_states_.end())
+    const auto iterator = fd_states_.find(timer.fd);
+    if (iterator == fd_states_.end())
         return false;
-    const auto& wait_slot = slot(*it->second, timer.event);
+    const auto& wait_slot = slot(*iterator->second, timer.event);
     return wait_slot && wait_slot->token == timer.token;
 }
 
@@ -247,10 +270,13 @@ void IoContext::expire_timers() {
         timers_.pop();
         if (!timer_active(timer))
             continue;
-        auto it = fd_states_.find(timer.fd);
-        FdState& state = *it->second;
+
+        auto iterator = fd_states_.find(timer.fd);
+        FdState& state = *iterator->second;
         complete(slot(state, timer.event), false);
         refresh_interest(state);
+        if (!state.reader && !state.writer)
+            fd_states_.erase(iterator);
     }
 }
 
@@ -264,17 +290,18 @@ int IoContext::next_poll_timeout() {
     if (timers_.top().deadline <= now)
         return 0;
     const auto remaining = timers_.top().deadline - now;
-    auto millis = std::chrono::duration_cast<Duration>(remaining);
-    if (millis < remaining)
-        millis += Duration{1};
-    if (millis.count() > INT_MAX)
+    auto milliseconds = std::chrono::duration_cast<Duration>(remaining);
+    if (milliseconds < remaining)
+        milliseconds += Duration{1};
+    if (milliseconds.count() > INT_MAX)
         return INT_MAX;
-    return static_cast<int>(millis.count());
+    return static_cast<int>(milliseconds.count());
 }
 
 bool IoContext::has_registered_waiter() const {
-    for (const auto& entry : fd_states_) {
-        if (entry.second->registered)
+    for (const auto& [fd, state] : fd_states_) {
+        (void)fd;
+        if (state->registered)
             return true;
     }
     return false;

@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.16)
-project(tinycoro VERSION 0.2.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(tinycoro VERSION 0.3.0 LANGUAGES CXX)
 
 option(TINYCORO_BUILD_EXAMPLES "Build example servers" ON)
 option(TINYCORO_BUILD_TESTS "Build tests" ON)
@@ -7,7 +7,7 @@ option(TINYCORO_BUILD_BENCHMARKS "Build microbenchmarks" OFF)
 option(TINYCORO_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSanitizer" OFF)
 option(TINYCORO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -19,12 +19,9 @@ endif()
 find_package(Threads REQUIRED)
 
 set(TINYCORO_SOURCES
-  src/coroutine.cpp
-  src/coroutine_pool.cpp
   src/event_loop.cpp
   src/http_parser.cpp
   src/io_context.cpp
-  src/scheduler.cpp
   src/tcp_connection.cpp
   src/tcp_server.cpp
   src/tcp_stream.cpp
@@ -39,7 +36,8 @@ target_include_directories(tinycoro
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(tinycoro PUBLIC Threads::Threads)
-target_compile_features(tinycoro PUBLIC cxx_std_17)
+target_compile_features(tinycoro PUBLIC cxx_std_20)
+target_compile_definitions(tinycoro PRIVATE _GNU_SOURCE)
 
 function(tinycoro_configure_target target)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -59,12 +57,9 @@ function(tinycoro_configure_target target)
 endfunction()
 
 tinycoro_configure_target(tinycoro)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(tinycoro PRIVATE -Wno-cast-function-type)
-endif()
 
 if(TINYCORO_BUILD_EXAMPLES)
-  foreach(example IN ITEMS echo_server http_echo coro_echo_server coro_http_echo)
+  foreach(example IN ITEMS echo_server http_echo callback_echo_server callback_http_echo)
     add_executable(${example} examples/${example}.cpp)
     target_link_libraries(${example} PRIVATE tinycoro::tinycoro)
     tinycoro_configure_target(${example})
@@ -72,9 +67,9 @@ if(TINYCORO_BUILD_EXAMPLES)
 endif()
 
 if(TINYCORO_BUILD_BENCHMARKS)
-  add_executable(coroutine_switch_bench benchmarks/coroutine_switch.cpp)
-  target_link_libraries(coroutine_switch_bench PRIVATE tinycoro::tinycoro)
-  tinycoro_configure_target(coroutine_switch_bench)
+  add_executable(scheduler_bench benchmarks/scheduler.cpp)
+  target_link_libraries(scheduler_bench PRIVATE tinycoro::tinycoro)
+  tinycoro_configure_target(scheduler_bench)
 endif()
 
 if(TINYCORO_BUILD_TESTS)
@@ -92,7 +87,7 @@ if(TINYCORO_BUILD_TESTS)
   endif()
 
   add_executable(run_tests
-    tests/test_coroutine.cpp
+    tests/test_task.cpp
     tests/test_http.cpp
     tests/test_io_context.cpp
     tests/test_pool.cpp

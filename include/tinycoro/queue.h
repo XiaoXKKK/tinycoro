@@ -1,18 +1,27 @@
 #pragma once
 #include <atomic>
-#include <cassert>
 #include <cstddef>
 #include <optional>
+#include <type_traits>
+#include <utility>
 
 namespace tinycoro {
 
 // -----------------------------------------------------------------------
 // SPSCQueue — single-producer / single-consumer lock-free ring queue.
-// Uses relaxed + acquire/release ordering; no CAS needed.
+// Uses relaxed + acquire/release ordering; no CAS needed. Capacity must be a
+// power of two and one slot is reserved to distinguish full from empty.
+// empty() and size() are observational snapshots under concurrent access.
 // -----------------------------------------------------------------------
 template <typename T, std::size_t Capacity> class SPSCQueue {
     static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
                   "Capacity must be a power of 2 and at least 2");
+    static_assert(std::is_default_constructible_v<T>,
+                  "SPSCQueue uses preallocated, default-constructed slots");
+    static_assert(std::is_nothrow_move_constructible_v<T>,
+                  "SPSCQueue pop requires nothrow move construction");
+    static_assert(std::atomic<std::size_t>::is_always_lock_free,
+                  "queue requires lock-free size_t atomics");
 
   public:
     SPSCQueue() : head_(0), tail_(0) {}
@@ -76,8 +85,12 @@ template <typename T, std::size_t Capacity> class SPSCQueue {
 // sequence counter so readers and writers can proceed independently.
 // -----------------------------------------------------------------------
 template <typename T, std::size_t Capacity> class MPMCQueue {
+    static_assert(std::is_nothrow_move_assignable_v<T>,
+                  "MPMCQueue requires nothrow move assignment after claiming a slot");
     static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
                   "Capacity must be a power of 2 and at least 2");
+    static_assert(std::atomic<std::size_t>::is_always_lock_free,
+                  "queue requires lock-free size_t atomics");
 
     struct Slot {
         alignas(64) std::atomic<std::size_t> sequence;

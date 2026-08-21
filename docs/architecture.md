@@ -1,81 +1,95 @@
 # Architecture
 
-## Scope
+## Component boundary
 
-The primary path is a single-threaded, N:1, cooperative I/O runtime. It connects
-`Coroutine`, `IoContext`, `EventLoop`, and `TcpStream`; the thread pool and bounded
-queues remain independent exercises and are not presented as an M:N scheduler.
-
-## Ownership
-
-- `IoContext` owns every live `Coroutine` in a task table keyed by a monotonic ID.
-- The ready queue stores IDs, not owning pointers, so duplicate/stale wakeups can
-  be ignored by checking the task state.
-- `TcpStream` owns its fd and calls `IoContext::cancel(fd)` before closing it.
-- An fd state is heap allocated because `EventLoop` retains a stable `Channel*`
-  while the unordered map may rehash.
-- Connection tasks capture `shared_ptr<TcpStream>` because C++17 `std::function`
-  requires copyable callables and the stream must live across suspension.
-
-## Task state machine
+The primary path is:
 
 ```text
-spawn
-  |
-  v
-Ready --resume--> Running --normal return--> destroyed
-  ^                 |
-  |                 +--yield()-------------------+
-  |                 |                            |
-  |                 +--EAGAIN--> Waiting         |
-  |                                 |            |
-  +-------- readiness/timeout/cancel-+------------+
+Task<T> -> IoContext -> EventLoop/epoll -> TcpListener/TcpStream
 ```
 
-A task may have only one outstanding suspension. An fd may have one reader and
-one writer, which matches the single-owner `TcpStream` model and rejects
-ambiguous concurrent reads early.
+`HttpParser` and `Buffer` sit above the transport. The callback
+`TcpServer`/`TcpConnection` path shares `EventLoop` but does not participate in
+`Task` scheduling. SPSC/MPMC queues and `ThreadPool` are independent concurrency
+utilities; adding them to the same repository does not make fd state cross-thread.
 
-## Readiness and edge-triggered I/O
+## Coroutine-frame ownership
 
-`EventLoop` uses `EPOLLET | EPOLLRDHUP` on Linux. Socket operations always attempt
-the syscall before registering interest. After
-`EAGAIN`, the current task is stored in the fd's read or write wait slot and its
-coroutine yields. EOF/HUP/error events wake both relevant directions so the next
-syscall can return the authoritative result.
+`Task<T>` is lazy: calling a coroutine creates a suspended frame and returns a
+move-only owner.
 
-Callback removal during dispatch is safe: after a read callback, the event loop
-checks that the same channel is still registered before invoking a write
-callback. This avoids calling through a connection destroyed by the read path.
+- `IoContext::spawn(Task<void>)` transfers a root frame into the context. The
+  context records the typed handle, sets a completion callback in the promise,
+  and places the handle on the ready queue.
+- `co_await` on an rvalue `Task<T>` transfers a child frame into the awaiter. The
+  child promise stores its parent continuation. Final suspend performs symmetric
+  transfer to that continuation; the awaiter destroys the child after
+  `await_resume` consumes its result or exception.
+- A completed root links itself into an intrusive completion list stored in its
+  promise. `IoContext` drains that list after resumption, removes ownership,
+  captures the first root exception, and destroys the frame.
+- Destroying an `IoContext` first removes fd registrations and timers, then
+  destroys any still-suspended root frames.
 
-## Deadlines
+This keeps the ready queue non-owning: it contains `coroutine_handle` values, while
+ownership lives in either the root map or a parent coroutine frame.
 
-Each timed wait receives a monotonic token and a `steady_clock` deadline. Timer
-entries are kept in a min-heap. A readiness event clears the wait slot but leaves
-its timer entry as a cheap tombstone; when the entry reaches the heap top, its
-token is compared with the current slot and stale entries are discarded. This
-avoids an indexed heap or O(n) cancellation.
+## Ready and waiting transitions
 
-## Backpressure
+```text
+spawn -> ready -> running
+                  |
+                  +-> yield -> ready
+                  +-> EAGAIN -> fd waiter -> ready event -> ready
+                  |                       -> deadline    -> ready
+                  |                       -> close       -> ready
+                  +-> final suspend -> completed -> destroy
+```
 
-`TcpStream::write_all` retains the caller-owned payload on the suspended
-coroutine stack. A partial `send` advances an offset; `EAGAIN` parks the task
-until writable readiness. The API does not append to an unbounded per-connection
-write buffer, so a slow peer naturally stops that connection task from
-producing the next response.
+`IoContext` is single-threaded. `spawn`, `run`, fd operations, and close
+cancellation must be performed on its executor thread. There is intentionally no
+eventfd-based cross-thread wakeup in the current scope.
 
-The callback `TcpConnection` path is intentionally different: it has a write
-buffer and exists as a Reactor comparison. The coroutine examples use
-`TcpStream`.
+## Readiness registration
 
-## Exception boundary
+Each fd has an `FdState` containing one optional reader, one optional writer, and
+one `Channel` registered with epoll. Full duplex is supported, but two concurrent
+readers or two concurrent writers on the same fd are rejected.
 
-Exceptions must not unwind across a C `makecontext` trampoline. `Coroutine::entry`
-captures `exception_ptr`, switches back to the caller, and `resume()` rethrows on
-the normal C++ stack. `IoContext` erases the failed task before propagating the
-exception from `run()`.
+`EventLoop` uses edge-triggered epoll with `EPOLLRDHUP`. Transport operations
+always attempt the syscall before awaiting readiness:
 
-The callback Reactor comparison is also fail-fast: internal setup errors and
-exceptions from user callbacks propagate to the `EventLoop::poll`/`run` caller
-after owned descriptors are cleaned up. Applications that choose the callback
-API define their own logging, retry, or shutdown policy at that loop boundary.
+- `read_some` retries `recv` after `EINTR`; it returns data, EOF, a structured
+  error, timeout, or close result.
+- `write_all` advances an offset until all bytes are sent; `EAGAIN` suspends the
+  task, so a slow peer applies backpressure to that connection task.
+- `accept` loops around transient errors and constructs an accepted stream through
+  an fd guard, closing the descriptor if object/control-block allocation fails.
+
+## Deadlines and cancellation
+
+A timed wait receives a monotonically increasing token and a steady-clock
+deadline. Timer entries live in a min-heap. Readiness or close clears the current
+wait slot; a later heap entry whose token no longer matches is a tombstone and is
+discarded. This avoids arbitrary deletion from `priority_queue`.
+
+`TcpStream::close` and `TcpListener::close` remove epoll interest, complete both
+directional waiters with a false result, and enqueue their continuations. Stream
+operations translate this to `IoStatus::Closed`; a suspended accept reports a
+closed-listener logic error rather than a timeout.
+
+## Error boundary
+
+Nested task exceptions are stored in the child promise and rethrown from
+`await_resume`. Unhandled root exceptions are rethrown by `IoContext::run` only
+after the completed root has been removed and destroyed. Allocation or epoll
+control failures propagate to the loop caller; registration paths roll back
+partially created state.
+
+## Backpressure and borrowed data
+
+`write_all` does not own its `string_view`. The caller must keep the referenced
+bytes alive until the task completes. This makes the memory boundary explicit and
+avoids an implicit unbounded output buffer. Applications needing queued writes
+must define a queue bound, overflow behavior, and completion policy above this
+primitive.

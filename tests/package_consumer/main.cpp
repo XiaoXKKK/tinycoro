@@ -1,7 +1,17 @@
-#include <tinycoro/buffer.h>
+#include <tinycoro/io_context.h>
+#include <tinycoro/task.h>
+
+namespace {
+tinycoro::Task<void> mark_ran(bool& ran) {
+    ran = true;
+    co_return;
+}
+} // namespace
 
 int main() {
-    tinycoro::Buffer buffer;
-    buffer.append("package-ok");
-    return buffer.retrieve_all_as_string() == "package-ok" ? 0 : 1;
+    bool ran = false;
+    tinycoro::IoContext context;
+    context.spawn(mark_ran(ran));
+    context.run();
+    return ran ? 0 : 1;
 }

@@ -26,11 +26,16 @@ EventLoop::~EventLoop() {
 void EventLoop::add_channel(Channel* channel) {
     if (!channel || channel->fd < 0)
         throw std::invalid_argument("invalid channel");
-    if (channels_.count(channel->fd) != 0) {
+
+    const auto [iterator, inserted] = channels_.emplace(channel->fd, channel);
+    if (!inserted)
         throw std::logic_error("channel already registered");
+    try {
+        ctl_add(channel);
+    } catch (...) {
+        channels_.erase(iterator);
+        throw;
     }
-    ctl_add(channel);
-    channels_.emplace(channel->fd, channel);
 }
 
 void EventLoop::update_channel(Channel* channel) {

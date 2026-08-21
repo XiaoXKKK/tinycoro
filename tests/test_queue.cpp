@@ -1,6 +1,7 @@
 #include "tinycoro/queue.h"
 #include <atomic>
 #include <gtest/gtest.h>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -42,7 +43,8 @@ TEST(SPSCQueueTest, Full) {
 TEST(SPSCQueueTest, ConcurrentSPSC) {
     SPSCQueue<int, 1024> q;
     constexpr int N = 10000;
-    std::atomic<int> sum{0};
+    std::vector<int> received;
+    received.reserve(N);
 
     std::thread producer([&] {
         for (int i = 0; i < N; ++i) {
@@ -52,21 +54,21 @@ TEST(SPSCQueueTest, ConcurrentSPSC) {
     });
 
     std::thread consumer([&] {
-        int received = 0;
-        while (received < N) {
+        while (received.size() < N) {
             auto v = q.pop();
             if (v) {
-                sum.fetch_add(*v, std::memory_order_relaxed);
-                ++received;
+                received.push_back(*v);
+            } else {
+                std::this_thread::yield();
             }
         }
     });
 
     producer.join();
     consumer.join();
-
-    int expected = N * (N - 1) / 2;
-    EXPECT_EQ(sum.load(), expected);
+    ASSERT_EQ(received.size(), static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i)
+        EXPECT_EQ(received[static_cast<std::size_t>(i)], i);
 }
 
 // ---- MPMCQueue ---------------------------------------------------------
@@ -87,8 +89,11 @@ TEST(MPMCQueueTest, ConcurrentMPMC) {
     constexpr int PER_PRODUCER = 2500; // total = 10000
     constexpr int TOTAL = PRODUCERS * PER_PRODUCER;
 
-    std::atomic<long long> sum{0};
+    auto seen = std::make_unique<std::atomic<unsigned int>[]>(TOTAL);
+    for (int i = 0; i < TOTAL; ++i)
+        seen[i].store(0, std::memory_order_relaxed);
     std::atomic<int> consumed_count{0};
+    std::atomic<bool> out_of_range{false};
 
     std::vector<std::thread> producers, consumers;
 
@@ -105,11 +110,16 @@ TEST(MPMCQueueTest, ConcurrentMPMC) {
     for (int c = 0; c < CONSUMERS; ++c) {
         consumers.emplace_back([&] {
             int val;
-            while (consumed_count.load(std::memory_order_relaxed) < TOTAL) {
+            for (;;) {
                 if (q.pop(val)) {
-                    sum.fetch_add(val, std::memory_order_relaxed);
-                    // Increment after adding to sum to avoid early exit
-                    consumed_count.fetch_add(1, std::memory_order_acq_rel);
+                    if (val < 0)
+                        return;
+                    if (val >= TOTAL) {
+                        out_of_range.store(true, std::memory_order_relaxed);
+                    } else {
+                        seen[val].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    consumed_count.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     std::this_thread::yield();
                 }
@@ -117,11 +127,17 @@ TEST(MPMCQueueTest, ConcurrentMPMC) {
         });
     }
 
-    for (auto& t : producers)
-        t.join();
-    for (auto& t : consumers)
-        t.join();
+    for (auto& producer : producers)
+        producer.join();
+    for (int i = 0; i < CONSUMERS; ++i) {
+        while (!q.push(-1))
+            std::this_thread::yield();
+    }
+    for (auto& consumer : consumers)
+        consumer.join();
 
-    long long expected = static_cast<long long>(TOTAL) * (TOTAL - 1) / 2;
-    EXPECT_EQ(sum.load(), expected);
+    EXPECT_FALSE(out_of_range.load(std::memory_order_relaxed));
+    EXPECT_EQ(consumed_count.load(std::memory_order_relaxed), TOTAL);
+    for (int i = 0; i < TOTAL; ++i)
+        EXPECT_EQ(seen[i].load(std::memory_order_relaxed), 1u);
 }

@@ -1,32 +1,34 @@
 # Benchmark methodology
 
-The repository intentionally publishes no QPS or latency comparison. Results
-from an unspecified "4-core machine" or a one-off cloud VM are not reproducible
+The repository intentionally publishes no QPS, latency, or comparison claim.
+Results from unspecified hardware or a one-off cloud VM are not reproducible
 evidence.
 
 ## Included microbenchmark
 
-`coroutine_switch_bench` measures scheduler round trips for one coroutine. One
-round trip includes the scheduler resume, `swapcontext` into the coroutine,
-`yield`, `swapcontext` back, and ready-queue bookkeeping. It must not be reported
-as the cost of one machine-level context switch.
+`scheduler_bench` measures repeated cooperative scheduling through
+`IoContext::yield()`. One reported iteration includes:
 
-The executable prints CSV:
+1. resuming the root coroutine from the ready queue;
+2. executing the loop body and constructing the yield awaiter;
+3. enqueueing the same `coroutine_handle` and suspending.
+
+The final completion/resume cost is included in the run total but amortized over
+all requested iterations. The result is not a machine context-switch cost, a
+standalone `coroutine_handle::resume` cost, or a network measurement.
+
+The executable prints:
 
 ```text
-run,round_trips,total_ns,ns_per_round_trip
+run,iterations,total_ns,ns_per_schedule
 ```
 
-Run an optimized build without sanitizers, pin it to one CPU where supported,
-and retain every run rather than only the best sample.
+Build without sanitizers, pin to one CPU where supported, and retain every sample:
 
 ```bash
-cmake -S . -B build-bench \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DTINYCORO_BUILD_BENCHMARKS=ON \
-  -DTINYCORO_BUILD_TESTS=OFF
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DTINYCORO_BUILD_BENCHMARKS=ON -DTINYCORO_BUILD_TESTS=OFF
 cmake --build build-bench --parallel
-./build-bench/coroutine_switch_bench 1000000 10 > results.csv
+taskset -c 2 ./build-bench/scheduler_bench 1000000 10 > results.csv
 ```
 
 ## Before publishing a number
@@ -34,13 +36,13 @@ cmake --build build-bench --parallel
 Record at least:
 
 - CPU model, physical/logical cores, governor, turbo state, OS/kernel, compiler,
-  flags, git commit, CPU affinity, and whether the host is virtualized;
-- warm-up policy, number of iterations/runs, all raw samples, median and tail
-  statistics, and the definition of one measured operation;
-- for a network benchmark: client tool/version, connection count, payload,
-  keep-alive policy, duration, server/client CPU placement, error count, and proof
-  that the client is not the bottleneck;
-- an equivalent baseline and identical environment before making a comparison.
+  flags, git commit, CPU affinity, and virtualization status;
+- warm-up policy, iterations, all raw runs, median/tail statistics, and the exact
+  definition of one measured operation;
+- for a network test: client/version, connections, request/response bytes,
+  keep-alive policy, duration, CPU placement, errors, and evidence that the client
+  is not the bottleneck;
+- an equivalent baseline built and run under the same conditions.
 
-Codespaces are suitable for functional verification, not for resume-grade
-latency claims because the underlying VM and noisy-neighbor load are not fixed.
+Codespaces are suitable for functional verification, not resume-grade performance
+claims, because VM hardware and neighboring load are not fixed.

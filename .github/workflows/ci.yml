@@ -34,13 +34,17 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
       - name: Test
-        env:
-          ASAN_OPTIONS: detect_stack_use_after_return=0
         run: ctest --test-dir build --output-on-failure
       - name: Verify installed CMake package
         run: |
           prefix="${{ runner.temp }}/tinycoro-install"
-          cmake --install build --prefix "$prefix"
+          cmake -S . -B package-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTINYCORO_BUILD_EXAMPLES=OFF \
+            -DTINYCORO_BUILD_TESTS=OFF \
+            -DTINYCORO_WARNINGS_AS_ERRORS=ON
+          cmake --build package-build --parallel
+          cmake --install package-build --prefix "$prefix"
           cmake -S tests/package_consumer -B package-consumer -G Ninja \
             -DCMAKE_PREFIX_PATH="$prefix"
           cmake --build package-consumer --parallel

@@ -1,19 +1,21 @@
 #include "tinycoro/buffer.h"
 #include "tinycoro/io_context.h"
+#include "tinycoro/task.h"
 #include "tinycoro/tcp_stream.h"
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <gtest/gtest.h>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <system_error>
 #include <thread>
-#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 using namespace std::chrono_literals;
@@ -25,9 +27,8 @@ struct SocketPair {
     int fd[2]{-1, -1};
 
     SocketPair() {
-        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) {
-            throw std::runtime_error("socketpair failed");
-        }
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0)
+            throw std::system_error(errno, std::generic_category(), "socketpair");
     }
 
     ~SocketPair() {
@@ -45,6 +46,11 @@ struct SocketPair {
     }
 };
 
+void require(bool condition, const char* operation) {
+    if (!condition)
+        throw std::system_error(errno, std::generic_category(), operation);
+}
+
 void fill_send_buffer(int fd) {
     const char data[4096]{};
     for (;;) {
@@ -55,45 +61,79 @@ void fill_send_buffer(int fd) {
             continue;
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return;
-        throw std::runtime_error("failed to fill socket send buffer");
+        throw std::system_error(errno, std::generic_category(), "fill send buffer");
     }
+}
+
+Task<void> read_once(std::shared_ptr<TcpStream> stream, Buffer& input, IoResult& result,
+                     IoContext::Duration timeout) {
+    result = co_await stream->read_some(input, 16, timeout);
+}
+
+Task<void> write_once(std::shared_ptr<TcpStream> stream, std::string_view data, IoResult& result,
+                      IoContext::Duration timeout) {
+    result = co_await stream->write_all(data, timeout);
+}
+
+Task<void> send_after_yield(IoContext& context, int fd, std::string_view data) {
+    co_await context.yield();
+    require(::send(fd, data.data(), data.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(data.size()),
+            "send");
+}
+
+Task<void> drive_read_and_write(int peer_fd) {
+    require(::send(peer_fd, "r", 1, MSG_NOSIGNAL) == 1, "send");
+    char drained[64 * 1024];
+    require(::recv(peer_fd, drained, sizeof(drained), 0) > 0, "recv");
+    co_return;
+}
+
+Task<void> close_stream(std::shared_ptr<TcpStream> stream, IoContext* context = nullptr) {
+    if (context)
+        co_await context->yield();
+    stream->close();
+}
+
+Task<void> echo_connection(IoContext& context, std::shared_ptr<TcpStream> connection) {
+    Buffer input;
+    const auto read = co_await connection->read_some(input, 64, 1s);
+    if (!read)
+        throw std::runtime_error("loopback read failed");
+    const std::string message(input.read_ptr(), read.bytes);
+    if (!(co_await connection->write_all(message, 1s)))
+        throw std::runtime_error("loopback write failed");
+    context.stop();
+}
+
+Task<void> accept_one(IoContext& context, TcpListener& listener) {
+    auto connection = co_await listener.accept(1s);
+    if (!connection)
+        throw std::runtime_error("loopback accept timed out");
+    context.spawn(echo_connection(context, std::move(connection)));
+}
+
+Task<void> accept_until_closed(TcpListener& listener) {
+    (void)co_await listener.accept(1s);
+}
+
+Task<void> close_listener_after_yield(IoContext& context, TcpListener& listener) {
+    co_await context.yield();
+    listener.close();
 }
 
 } // namespace
 
-TEST(IoContextTest, CooperativeYieldIsFifo) {
-    IoContext context;
-    std::vector<int> order;
-
-    context.spawn([&] {
-        order.push_back(1);
-        context.yield();
-        order.push_back(3);
-    });
-    context.spawn([&] {
-        order.push_back(2);
-        context.yield();
-        order.push_back(4);
-    });
-
-    context.run();
-    EXPECT_EQ(order, (std::vector<int>{1, 2, 3, 4}));
-}
-
-TEST(IoContextTest, ReadableEventResumesSuspendedCoroutine) {
+TEST(IoContextTest, ReadableEventResumesSuspendedTask) {
     SocketPair sockets;
     IoContext context;
     auto stream = std::make_shared<TcpStream>(context, sockets.release(0));
     Buffer input;
     IoResult result;
 
-    context.spawn([&] { result = stream->read_some(input, 16, 500ms); });
-    context.spawn([&] {
-        context.yield();
-        ASSERT_EQ(::send(sockets.fd[1], "ready", 5, 0), 5);
-    });
-
+    context.spawn(read_once(stream, input, result, 500ms));
+    context.spawn(send_after_yield(context, sockets.fd[1], "ready"));
     context.run();
+
     EXPECT_EQ(result.status, IoStatus::Ok);
     EXPECT_EQ(input.retrieve_all_as_string(), "ready");
 }
@@ -111,15 +151,9 @@ TEST(IoContextTest, ReadAndWriteWaitersCanShareOneFd) {
     Buffer input;
     IoResult read_result;
     IoResult write_result;
-
-    context.spawn([&] { read_result = stream->read_some(input, 8, 500ms); });
-    context.spawn([&] { write_result = stream->write_all("w", 500ms); });
-    context.spawn([&] {
-        ASSERT_EQ(::send(sockets.fd[1], "r", 1, MSG_NOSIGNAL), 1);
-        char drained[64 * 1024];
-        ASSERT_GT(::recv(sockets.fd[1], drained, sizeof(drained), 0), 0);
-    });
-
+    context.spawn(read_once(stream, input, read_result, 500ms));
+    context.spawn(write_once(stream, "w", write_result, 500ms));
+    context.spawn(drive_read_and_write(sockets.fd[1]));
     context.run();
 
     EXPECT_EQ(read_result.status, IoStatus::Ok);
@@ -136,7 +170,7 @@ TEST(IoContextTest, ReadDeadlineExpiresWithoutBusyPolling) {
     IoResult result;
     const auto begin = IoContext::Clock::now();
 
-    context.spawn([&] { result = stream->read_some(input, 16, 20ms); });
+    context.spawn(read_once(stream, input, result, 20ms));
     context.run();
 
     const auto elapsed = IoContext::Clock::now() - begin;
@@ -157,7 +191,7 @@ TEST(IoContextTest, PartialWritesApplyBackpressureAndResume) {
     std::string received;
     received.reserve(payload.size());
 
-    std::thread reader([&] {
+    std::jthread reader([&] {
         char buffer[8192];
         while (received.size() < payload.size()) {
             const ssize_t count = ::recv(sockets.fd[1], buffer, sizeof(buffer), 0);
@@ -168,7 +202,7 @@ TEST(IoContextTest, PartialWritesApplyBackpressureAndResume) {
     });
 
     IoResult result;
-    context.spawn([&] { result = stream->write_all(payload, 2s); });
+    context.spawn(write_once(stream, payload, result, 2s));
     context.run();
     stream->close();
     reader.join();
@@ -182,44 +216,54 @@ TEST(IoContextTest, TcpListenerAndStreamCompleteLoopbackEcho) {
     IoContext context;
     TcpListener listener(context, 0, "127.0.0.1");
     std::string client_response;
+    std::exception_ptr client_error;
 
-    context.spawn([&] {
-        auto connection = listener.accept(1s);
-        ASSERT_NE(connection, nullptr);
-        context.spawn([&, connection] {
-            Buffer input;
-            const auto read = connection->read_some(input, 64, 1s);
-            ASSERT_EQ(read.status, IoStatus::Ok);
-            const std::string message(input.read_ptr(), read.bytes);
-            ASSERT_EQ(connection->write_all(message, 1s).status, IoStatus::Ok);
-            context.stop();
-        });
-    });
+    context.spawn(accept_one(context, listener));
+    std::jthread client([&] {
+        int fd = -1;
+        try {
+            fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            require(fd >= 0, "socket");
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(listener.port());
+            require(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1, "inet_pton");
+            require(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+                    "connect");
+            require(::send(fd, "loopback", 8, MSG_NOSIGNAL) == 8, "send");
 
-    std::thread client([&] {
-        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        ASSERT_GE(fd, 0);
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_port = htons(listener.port());
-        ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
-        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
-
-        ASSERT_EQ(::send(fd, "loopback", 8, 0), 8);
-        char response[8];
-        std::size_t received = 0;
-        while (received < sizeof(response)) {
-            const ssize_t count = ::recv(fd, response + received, sizeof(response) - received, 0);
-            ASSERT_GT(count, 0);
-            received += static_cast<std::size_t>(count);
+            char response[8];
+            std::size_t received = 0;
+            while (received < sizeof(response)) {
+                const ssize_t count =
+                    ::recv(fd, response + received, sizeof(response) - received, 0);
+                require(count > 0, "recv");
+                received += static_cast<std::size_t>(count);
+            }
+            client_response.assign(response, sizeof(response));
+            ::close(fd);
+        } catch (...) {
+            if (fd >= 0)
+                ::close(fd);
+            client_error = std::current_exception();
         }
-        client_response.assign(response, sizeof(response));
-        ::close(fd);
     });
 
     context.run();
     client.join();
+    if (client_error)
+        std::rethrow_exception(client_error);
     EXPECT_EQ(client_response, "loopback");
+}
+
+TEST(IoContextTest, ClosingListenerCancelsSuspendedAccept) {
+    IoContext context;
+    TcpListener listener(context, 0, "127.0.0.1");
+    context.spawn(accept_until_closed(listener));
+    context.spawn(close_listener_after_yield(context, listener));
+
+    EXPECT_THROW(context.run(), std::logic_error);
+    EXPECT_EQ(context.task_count(), 0u);
 }
 
 TEST(IoContextTest, ClosingStreamCancelsSuspendedRead) {
@@ -229,12 +273,8 @@ TEST(IoContextTest, ClosingStreamCancelsSuspendedRead) {
     Buffer input;
     IoResult result;
 
-    context.spawn([&] { result = stream->read_some(input, 16, 1s); });
-    context.spawn([&] {
-        context.yield();
-        stream->close();
-    });
-
+    context.spawn(read_once(stream, input, result, 1s));
+    context.spawn(close_stream(stream, &context));
     context.run();
     EXPECT_EQ(result.status, IoStatus::Closed);
 }
@@ -252,20 +292,12 @@ TEST(IoContextTest, ClosingStreamCancelsReadAndWriteWaiters) {
     Buffer input;
     IoResult read_result;
     IoResult write_result;
-
-    context.spawn([&] { read_result = stream->read_some(input, 8, 1s); });
-    context.spawn([&] { write_result = stream->write_all("w", 1s); });
-    context.spawn([&] { stream->close(); });
-
+    context.spawn(read_once(stream, input, read_result, 1s));
+    context.spawn(write_once(stream, "w", write_result, 1s));
+    context.spawn(close_stream(stream));
     context.run();
 
     EXPECT_EQ(read_result.status, IoStatus::Closed);
     EXPECT_EQ(write_result.status, IoStatus::Closed);
     EXPECT_FALSE(stream->is_open());
-}
-
-TEST(IoContextTest, TaskExceptionsReturnToCaller) {
-    IoContext context;
-    context.spawn([] { throw std::runtime_error("task failed"); });
-    EXPECT_THROW(context.run(), std::runtime_error);
 }

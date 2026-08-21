@@ -1,61 +1,83 @@
 # Design decisions
 
-## Why stackful `ucontext`?
+## One coroutine model
 
-The project uses stackful coroutines to make suspension mechanics visible:
-register state, an independent stack, caller/callee contexts, and the constraint
-that the coroutine object cannot move after `makecontext` embeds its address.
-This is educational rather than a production recommendation. `ucontext` was
-removed from POSIX.1-2008.
+The repository uses C++20 stackless coroutine frames as its only coroutine
+implementation. `Task<T>`, `promise_type`, `coroutine_handle`, and explicit
+awaiters form the complete execution path; there is no second scheduler or
+reusable-stack abstraction behind the API.
 
-A C++20 version would model readiness through awaiters and avoid a fixed stack
-per connection. It would also require explicit lifetime handling for coroutine
-frames and continuation ownership—different trade-offs worth discussing, not a
-free replacement.
+## Lazy, move-only tasks
 
-## Why N:1 instead of M:N?
+Lazy start makes ownership transfer visible: a task either remains in a local
+`Task` object, moves into an awaiting expression, or moves into
+`IoContext::spawn`. Copying and lvalue `co_await` are disabled so that two owners
+cannot destroy the same frame.
 
-The existing code has a thread pool and MPMC queue, but merely placing those
-modules in one repository does not create an M:N runtime. The implemented main
-path keeps an `IoContext` and all of its fd state on one OS thread. This makes
-ownership and readiness deterministic and prevents overstating what the code
-does.
+Root spawning is limited to `Task<void>` because detached result ownership would
+otherwise be ambiguous. Nested `Task<T>` values remain structured under a parent
+coroutine.
 
-An M:N extension would need per-worker pollers or a cross-thread wakeup fd,
-work-stealing/affinity policy, migration rules for fd ownership, shutdown and
-cancellation semantics, and tests for races across those boundaries.
+## Single-threaded fd ownership
 
-`IoContext::yield()` always requeues its running task, so CPU-only cooperative
-tasks are supported. If tasks remain after the ready queue drains but no fd or
-timer can wake them, `run()` throws instead of blocking forever; that condition
-is treated as a scheduler-invariant violation rather than a normal idle state.
+All coroutine frames and fd wait state in an `IoContext` stay on one executor
+thread. This avoids hidden task migration, fd-affinity races, and a cross-thread
+cancellation protocol. Scaling across cores is an application-level choice: run
+independent contexts with explicit connection distribution.
 
-## Why one waiter per fd direction?
+The separate `ThreadPool` is for bounded CPU/general tasks. It does not resume
+`IoContext` coroutines.
 
-Concurrent reads on one byte stream have ambiguous message ownership. Allowing
-multiple readers would require a dispatch/fairness policy and make cancellation
-harder. `IoContext` therefore accepts one reader and one writer and throws on a
-duplicate direction. Full duplex remains possible.
+## One waiter per fd direction
 
-## Why a tokenized timer heap?
+Concurrent reads on one byte stream make message ownership ambiguous, and
+concurrent writes need an ordering policy. The context therefore accepts one
+reader and one writer per fd. Full duplex remains possible, while duplicate
+directional waits fail immediately.
 
-Removing an arbitrary timer from `priority_queue` is expensive. Each wait gets a
-unique token. Readiness clears the slot; later, the heap entry is recognized as
-stale. The trade-off is temporary tombstones and potentially extra timer
-wakeups, bounded by the number of completed timed waits.
+## Edge-triggered readiness
 
-## Why synchronous backpressure?
+Transport methods attempt `accept4`, `recv`, or `send` before registering a wait
+and retry after every wakeup. This prevents readiness notifications from becoming
+the source of truth: the syscall result remains authoritative. Terminal epoll
+events wake both applicable directions so EOF and socket errors are observed by
+the retry.
 
-A common callback API queues every `send`, which needs a high-water mark,
-overflow policy, and write-complete callbacks. The coroutine path instead keeps
-one response in the task and waits for the socket to drain. This has a clear
-memory bound per task but prevents that task from doing other work until the
-peer catches up.
+## Tokenized deadline heap
 
-## Why keep the callback path?
+Removing arbitrary entries from a binary heap would require an index or linear
+search. Each wait instead receives a token. Completion clears the slot, and stale
+timer entries are ignored later. The trade-off is temporary tombstones bounded by
+the number of completed timed waits not yet popped.
 
-`TcpConnection`/`TcpServer` provide a compact Reactor comparison for interviews:
-callbacks make readiness explicit but spread one request across control-flow
-edges; stackful tasks restore sequential control flow but hide suspension points
-inside I/O methods. The two paths share `EventLoop` but are not mixed in one
-connection.
+## Synchronous write backpressure
+
+`write_all` keeps one caller-owned payload and suspends on a full kernel send
+buffer. It does not enqueue unlimited responses. This bounds hidden library
+memory, but the connection task cannot produce its next response until the peer
+drains the current one.
+
+## Descriptor adoption before allocation
+
+`accept4` returns a raw descriptor before a `TcpStream` and its `shared_ptr`
+control block are allocated. The descriptor is therefore placed in a small RAII
+guard first. Either allocation failure closes it; successful construction
+transfers ownership exactly once.
+
+## Queue and thread-pool boundaries
+
+`SPSCQueue` is a power-of-two ring for exactly one producer and one consumer; one
+slot is reserved. `MPMCQueue` uses per-slot sequence numbers and exposes a fixed
+capacity. Both preallocate their slots and use lock-free `size_t` atomics.
+
+`ThreadPool` blocks idle `std::jthread` workers on a counting semaphore. A
+lifecycle mutex serializes submission with shutdown, so the pool is bounded and
+blocking when idle but is not advertised as fully lock-free. Submitted task
+exceptions are retained for the caller.
+
+## Why retain the callback Reactor
+
+Callbacks remain a practical event-driven interface. The callback server is kept
+as a small comparison for ownership and control flow; it is clearly named, uses
+the same checked epoll wrapper, and is not an alternate path inside the coroutine
+API.
