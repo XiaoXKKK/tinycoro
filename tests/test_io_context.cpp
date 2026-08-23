@@ -121,6 +121,25 @@ Task<void> close_listener_after_yield(IoContext& context, TcpListener& listener)
     listener.close();
 }
 
+Task<void> record_read_turn(std::shared_ptr<TcpStream> stream, int& scheduler_turn,
+                            int& observed_turn) {
+    Buffer input;
+    const auto result = co_await stream->read_some(input, 1, 500ms);
+    if (!result)
+        throw std::runtime_error("fairness read failed");
+    observed_turn = scheduler_turn;
+}
+
+Task<void> make_readable_while_yielding(IoContext& context, int peer_fd,
+                                        int& scheduler_turn, int turns) {
+    for (int index = 0; index < turns; ++index) {
+        ++scheduler_turn;
+        if (index == 0)
+            require(::send(peer_fd, "x", 1, MSG_NOSIGNAL) == 1, "send");
+        co_await context.yield();
+    }
+}
+
 } // namespace
 
 TEST(IoContextTest, ReadableEventResumesSuspendedTask) {
@@ -136,6 +155,22 @@ TEST(IoContextTest, ReadableEventResumesSuspendedTask) {
 
     EXPECT_EQ(result.status, IoStatus::Ok);
     EXPECT_EQ(input.retrieve_all_as_string(), "ready");
+}
+
+TEST(IoContextTest, YieldingTaskDoesNotStarveFdReadiness) {
+    SocketPair sockets;
+    IoContext context;
+    auto stream = std::make_shared<TcpStream>(context, sockets.release(0));
+    int scheduler_turn = 0;
+    int observed_turn = 0;
+    constexpr int turns = 1000;
+
+    context.spawn(record_read_turn(stream, scheduler_turn, observed_turn));
+    context.spawn(make_readable_while_yielding(context, sockets.fd[1], scheduler_turn, turns));
+    context.run();
+
+    EXPECT_GT(observed_turn, 0);
+    EXPECT_LT(observed_turn, turns);
 }
 
 TEST(IoContextTest, ReadAndWriteWaitersCanShareOneFd) {

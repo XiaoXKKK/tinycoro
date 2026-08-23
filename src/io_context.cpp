@@ -70,11 +70,9 @@ void IoContext::run() {
             expire_timers();
             if (stop_requested_ || roots_.empty())
                 break;
-            if (!ready_.empty())
-                continue;
-
-            const int poll_timeout = next_poll_timeout();
-            if (poll_timeout < 0 && !has_registered_waiter()) {
+            const bool has_ready = !ready_.empty();
+            const int poll_timeout = has_ready ? 0 : next_poll_timeout();
+            if (!has_ready && poll_timeout < 0 && !has_registered_waiter()) {
                 throw std::logic_error("IoContext Task has no readiness or timer wake source");
             }
             loop_.poll(poll_timeout);
@@ -138,7 +136,10 @@ void IoContext::schedule(std::coroutine_handle<> continuation) {
 }
 
 void IoContext::run_ready() {
-    while (!ready_.empty() && !stop_requested_) {
+    // Bound each scheduler turn so a task that repeatedly yields cannot keep
+    // fd readiness and deadline processing from running indefinitely.
+    const std::size_t batch = ready_.size();
+    for (std::size_t index = 0; index < batch && !stop_requested_; ++index) {
         const std::coroutine_handle<> continuation = ready_.front();
         ready_.pop_front();
         if (!continuation || continuation.done())

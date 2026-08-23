@@ -2,18 +2,20 @@
 
 ## Automated coverage
 
-The current suite contains 44 GoogleTest cases, each registered separately with
+The current suite contains 47 GoogleTest cases, each registered separately with
 CTest:
 
 - 7 task/runtime cases: lazy start, nested values, FIFO yield scheduling, root
   and nested exception propagation, empty-task rejection, and destruction of
   suspended frames;
-- 7 buffer cases for cursor bounds, compaction/growth, and direct-write commit;
+- 9 buffer cases for cursor bounds, zero-capacity construction, overflow guards,
+  compaction/growth, and direct-write commit;
 - 12 HTTP parser cases covering fragmentation, pipelining, strict request lines,
   framing ambiguity, transfer-encoding rejection, and exact configured limits;
-- 8 I/O cases covering readable resumption, simultaneous read/write waiters,
-  deadlines, a forced 1 MiB partial-write path, real loopback accept/echo, and
-  close cancellation for listeners and streams;
+- 9 I/O cases covering readable resumption, fairness under repeated coroutine
+  yields, simultaneous read/write waiters, deadlines, a forced 1 MiB
+  partial-write path, real loopback accept/echo, and close cancellation for
+  listeners and streams;
 - 5 thread-pool cases covering invalid construction, shutdown rejection, drain,
   concurrent submission with exactly-once IDs, and exception retention;
 - 5 queue cases, including ordered SPSC delivery and MPMC exactly-once validation

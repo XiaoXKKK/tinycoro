@@ -73,7 +73,7 @@ ctest --test-dir build-release --output-on-failure
 ```
 
 CI runs GCC with ASan/UBSan and Clang in Release mode. The current suite contains
-44 independently registered tests; [testing notes](docs/testing.md) describe what
+47 independently registered tests; [testing notes](docs/testing.md) describe what
 they cover and what remains unproven.
 
 ## HTTP smoke test

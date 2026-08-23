@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,7 +15,7 @@ class Buffer {
     static constexpr std::size_t kInitialSize = 4096;
 
     explicit Buffer(std::size_t initial = kInitialSize)
-        : buf_(initial), read_idx_(0), write_idx_(0) {}
+        : buf_(initial == 0 ? 1 : initial), read_idx_(0), write_idx_(0) {}
 
     std::size_t readable() const { return write_idx_ - read_idx_; }
     std::size_t writable() const { return buf_.size() - write_idx_; }
@@ -30,6 +31,10 @@ class Buffer {
     }
 
     void append(const char* data, std::size_t len) {
+        if (len == 0)
+            return;
+        if (!data)
+            throw std::invalid_argument("Buffer::append requires non-null data");
         ensure_writable(len);
         std::memcpy(write_ptr(), data, len);
         write_idx_ += len;
@@ -71,6 +76,8 @@ class Buffer {
             read_idx_ = 0;
             write_idx_ = size;
         } else {
+            if (len > std::numeric_limits<std::size_t>::max() - write_idx_)
+                throw std::length_error("Buffer capacity overflow");
             buf_.resize(write_idx_ + len);
         }
     }

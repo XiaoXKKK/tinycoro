@@ -1,6 +1,7 @@
 #include "tinycoro/buffer.h"
 #include "tinycoro/http_parser.h"
 #include <gtest/gtest.h>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -55,6 +56,21 @@ TEST(BufferTest, GrowsOnLargeAppend) {
     const std::string large(1024, 'x');
     buffer.append(large);
     EXPECT_EQ(buffer.readable(), 1024u);
+}
+
+TEST(BufferTest, ZeroInitialCapacityStillSupportsAppend) {
+    Buffer buffer(0);
+    buffer.append("x", 1);
+    EXPECT_EQ(buffer.retrieve_all_as_string(), "x");
+}
+
+TEST(BufferTest, RejectsNullInputAndCapacityOverflow) {
+    Buffer buffer(4);
+    EXPECT_THROW(buffer.append(nullptr, 1), std::invalid_argument);
+
+    buffer.append("x", 1);
+    EXPECT_THROW(buffer.ensure_writable(std::numeric_limits<std::size_t>::max()),
+                 std::length_error);
 }
 
 TEST(HttpParserTest, SimpleGet) {
